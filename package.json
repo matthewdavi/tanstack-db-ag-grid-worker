@@ -1,0 +1,21 @@
+{
+  "name": "@sandbox/demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "../../node_modules/.bin/vite",
+    "build": "../../node_modules/.bin/vite build",
+    "preview": "../../node_modules/.bin/vite preview"
+  },
+  "dependencies": {
+    "@sandbox/ag-grid-translator": "workspace:*",
+    "@sandbox/worker-store": "workspace:*",
+    "@tanstack/react-db": "^0.1.75",
+    "ag-grid-community": "^35.1.0",
+    "ag-grid-enterprise": "^35.1.0",
+    "ag-grid-react": "^35.1.0",
+    "effect": "^3.19.19",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  }
+}
