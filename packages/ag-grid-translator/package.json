@@ -1,0 +1,12 @@
+{
+  "name": "@sandbox/ag-grid-translator",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "ag-grid-community": "^35.1.0",
+    "effect": "^3.19.19"
+  }
+}

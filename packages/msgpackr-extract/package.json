@@ -1,0 +1,10 @@
+{
+  "name": "msgpackr-extract",
+  "private": true,
+  "version": "3.0.3",
+  "type": "commonjs",
+  "main": "./index.cjs",
+  "exports": {
+    ".": "./index.cjs"
+  }
+}

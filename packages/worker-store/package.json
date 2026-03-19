@@ -1,0 +1,17 @@
+{
+  "name": "@sandbox/worker-store",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@sandbox/ag-grid-translator": "workspace:*",
+    "@effect/platform": "^0.94.5",
+    "@effect/platform-browser": "^0.74.0",
+    "@faker-js/faker": "^9.9.0",
+    "ag-grid-community": "^35.1.0",
+    "@tanstack/db": "^0.5.31",
+    "effect": "^3.19.19"
+  }
+}

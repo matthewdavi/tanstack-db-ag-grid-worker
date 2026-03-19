@@ -1,21 +1,36 @@
 {
-  "name": "@sandbox/demo",
+  "name": "ag-grid-worker-sandbox",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "../../node_modules/.bin/vite",
-    "build": "../../node_modules/.bin/vite build",
-    "preview": "../../node_modules/.bin/vite preview"
+  "packageManager": "bun@1.2.22",
+  "overrides": {
+    "msgpackr-extract": "workspace:*"
   },
-  "dependencies": {
-    "@sandbox/ag-grid-translator": "workspace:*",
-    "@sandbox/worker-store": "workspace:*",
-    "@tanstack/react-db": "^0.1.75",
-    "ag-grid-community": "^35.1.0",
-    "ag-grid-enterprise": "^35.1.0",
-    "ag-grid-react": "^35.1.0",
-    "effect": "^3.19.19",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run demo:dev",
+    "demo:dev": "cd apps/demo && ../../node_modules/.bin/vite",
+    "build": "bun run typecheck && bun run demo:build",
+    "bench:collection": "bun run packages/worker-store/scripts/stress-collection.ts",
+    "demo:build": "cd apps/demo && ../../node_modules/.bin/vite build",
+    "test": "./node_modules/.bin/vitest run",
+    "test:watch": "./node_modules/.bin/vitest",
+    "typecheck": "./node_modules/.bin/tsc -p tsconfig.typecheck.json --noEmit",
+    "check": "bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^24.5.2",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "jsdom": "^27.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.7",
+    "vitest": "^4.0.0"
   }
 }

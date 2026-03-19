@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/ag-grid-translator/tsconfig.json"
+    },
+    {
+      "path": "./packages/worker-store/tsconfig.json"
+    },
+    {
+      "path": "./apps/demo/tsconfig.json"
+    }
+  ]
+}
