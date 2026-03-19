@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { translateAdvancedFilter, translateColumnFilters } from "@sandbox/ag-grid-translator";
 
-import { createRowCollection, executeGridQuery } from "./query-runtime";
+import {
+  collectWindowRows,
+  createQueryCollection,
+  createRowCollection,
+  createRowCountCollection,
+  executeGridQuery,
+} from "./query-runtime";
 
 const rows = [
   {
@@ -146,12 +152,48 @@ describe("TanStack DB grid query runtime", () => {
       predicate: null,
       sorts: [{ field: "athlete", direction: "asc" }],
     }, {
-      offset: 1,
-      limit: 2,
+      startRow: 1,
+      endRow: 3,
     });
 
     expect(results.rowCount).toBe(4);
     expect(results.rows.map((row) => row.id)).toEqual(["1", "3"]);
+  });
+
+  it("derives row counts from the filtered query without carrying over sorts", async () => {
+    const collection = createRowCollection({
+      id: "athletes-count",
+      rows,
+    });
+
+    const rowCountCollection = createRowCountCollection(collection, {
+      predicate: null,
+      sorts: [{ field: "athlete", direction: "desc" }],
+    });
+
+    await rowCountCollection.preload();
+
+    expect(rowCountCollection.size).toBe(4);
+    expect(rowCountCollection.toArray.map((row) => row.id)).toEqual(["1", "2", "3", "4"]);
+  });
+
+  it("collects the requested range from a full sorted query collection", async () => {
+    const collection = createRowCollection({
+      id: "athletes-slice",
+      rows,
+    });
+
+    const queryCollection = createQueryCollection(collection, {
+      predicate: null,
+      sorts: [{ field: "athlete", direction: "asc" }],
+    });
+
+    await queryCollection.preload();
+
+    expect(collectWindowRows(queryCollection, { startRow: 1, endRow: 3 }).map((row) => row.id)).toEqual([
+      "1",
+      "3",
+    ]);
   });
 
   it("applies direct writes atomically through writeBatch", () => {

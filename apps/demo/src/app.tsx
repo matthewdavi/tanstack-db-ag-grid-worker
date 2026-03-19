@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 
 import type {
   ColDef,
+  FilterChangedEvent,
   GridApi,
   GridReadyEvent,
   GetRowIdParams,
@@ -40,6 +41,15 @@ AgGridModuleRegistry.registerModules([AllEnterpriseModule]);
 const STORE_ID = "olympic-athletes";
 const ROW_KEY = "id";
 const INITIAL_DEMO_ROW_COUNT = 100_000;
+const VIEWPORT_LOADING_OVERLAY = `
+  <div class="viewport-loading-overlay" role="status" aria-live="polite">
+    <span class="viewport-loading-overlay__pulse"></span>
+    <div class="viewport-loading-overlay__copy">
+      <strong>Refreshing live query</strong>
+      <span>Recomputing filters and sort in the worker.</span>
+    </div>
+  </div>
+`;
 
 const COLUMN_DEFS: ReadonlyArray<ColDef<RowRecord>> = [
   {
@@ -372,10 +382,15 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
     },
     fulfilledRange: null,
     requestVersion: 0,
+    isLoading: true,
     lastPatchLatencyMs: null,
     ignoredPatchCount: 0,
     patchCount: 0,
   });
+
+  useEffect(() => {
+    apiRef.current?.setGridOption("loading", diagnostics.isLoading);
+  }, [diagnostics.isLoading]);
 
   useEffect(() => {
     if (apiRef.current === null) {
@@ -401,6 +416,7 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
       "viewportDatasource",
       datasource,
     );
+    apiRef.current.setGridOption("loading", diagnostics.isLoading);
   }, [props.collection]);
 
   const handleReady = (event: GridReadyEvent<RowRecord>) => {
@@ -424,10 +440,19 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
       "viewportDatasource",
       datasource,
     );
+    event.api.setGridOption("loading", diagnostics.isLoading);
   };
 
-  const refreshViewport = () => {
-    datasourceRef.current?.refreshQuery();
+  const refreshViewport = (options?: {
+    debounce?: boolean;
+  }) => {
+    datasourceRef.current?.refreshQuery(options);
+  };
+
+  const handleFilterChanged = (event: FilterChangedEvent<RowRecord>) => {
+    refreshViewport({
+      debounce: event.afterFloatingFilter === true,
+    });
   };
 
   const injectUpdate = () => {
@@ -496,7 +521,9 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
         </label>
         <button
           className="action-button action-button--ghost"
-          onClick={refreshViewport}
+          onClick={() => {
+            refreshViewport();
+          }}
           type="button"
         >
           Refresh query snapshot
@@ -530,19 +557,22 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
           Ignored patches <strong>{diagnostics.ignoredPatchCount}</strong>
         </span>
       </div>
-      <div className="grid-shell ag-theme-quartz">
+      <div className="grid-shell grid-shell--viewport ag-theme-quartz">
         <AgGridReact<RowRecord>
           columnDefs={COLUMN_DEFS as ColDef<RowRecord>[]}
           defaultColDef={DEFAULT_COL_DEF}
           getRowId={getStableRowId}
+          overlayLoadingTemplate={VIEWPORT_LOADING_OVERLAY}
           rowModelType="viewport"
           statusBar={createRowCountStatusBar("Worker rows", rowCount, metrics)}
           viewportRowModelPageSize={50}
           viewportRowModelBufferSize={20}
           rowBuffer={0}
           onGridReady={handleReady}
-          onFilterChanged={refreshViewport}
-          onSortChanged={refreshViewport}
+          onFilterChanged={handleFilterChanged}
+          onSortChanged={() => {
+            refreshViewport();
+          }}
         />
       </div>
     </GridCard>

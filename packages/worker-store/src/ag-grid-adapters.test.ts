@@ -412,6 +412,7 @@ describe("ag-grid worker adapters", () => {
     const diagnostics: Array<{
       requestedRange: { startRow: number; endRow: number };
       fulfilledRange: { startRow: number; endRow: number } | null;
+      isLoading: boolean;
       lastPatchLatencyMs: number | null;
     }> = [];
     const datasource = createViewportDatasource(collection, {
@@ -420,6 +421,7 @@ describe("ag-grid worker adapters", () => {
         diagnostics.push({
           requestedRange: nextDiagnostics.requestedRange,
           fulfilledRange: nextDiagnostics.fulfilledRange,
+          isLoading: nextDiagnostics.isLoading,
           lastPatchLatencyMs: nextDiagnostics.lastPatchLatencyMs,
         });
       },
@@ -445,7 +447,6 @@ describe("ag-grid worker adapters", () => {
           entry.fulfilledRange?.startRow === 20,
       ),
     );
-
     expect(fulfilledDiagnostics.requestedRange).toEqual({
       startRow: 20,
       endRow: 40,
@@ -454,6 +455,7 @@ describe("ag-grid worker adapters", () => {
       startRow: 20,
       endRow: 40,
     });
+    expect(fulfilledDiagnostics.isLoading).toBe(false);
     expect(fulfilledDiagnostics.lastPatchLatencyMs).not.toBeNull();
   });
 
@@ -604,11 +606,11 @@ describe("ag-grid worker adapters", () => {
       } as IViewportDatasourceParams<RowRecord>);
 
       filterValue = "R";
-      datasource.refreshQuery();
+      datasource.refreshQuery({ debounce: true });
       filterValue = "Re";
-      datasource.refreshQuery();
+      datasource.refreshQuery({ debounce: true });
       filterValue = "Reilly";
-      datasource.refreshQuery();
+      datasource.refreshQuery({ debounce: true });
 
       await vi.advanceTimersByTimeAsync(199);
       expect(replaceCalls).toHaveLength(0);
@@ -632,5 +634,76 @@ describe("ag-grid worker adapters", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("refreshes viewport queries immediately when debounce is disabled", async () => {
+    let openCalls = 0;
+    const replaceCalls: Array<GridQueryState> = [];
+    const collection = {
+      storeId: "immediate-refresh",
+      openViewportSession: (request: {
+        startRow: number;
+        endRow: number;
+        query: GridQueryState;
+        sessionId?: string;
+      }) => {
+        openCalls += 1;
+
+        return {
+          sessionId: request.sessionId ?? "immediate-refresh-session",
+          updates: Stream.empty,
+          replace: async (nextRequest: {
+            startRow: number;
+            endRow: number;
+            query: GridQueryState;
+          }) => {
+            replaceCalls.push(nextRequest.query);
+
+            return {
+              sessionId: "immediate-refresh-session",
+              replaced: true,
+            };
+          },
+          close: async () => ({
+            sessionId: "immediate-refresh-session",
+            closed: true,
+          }),
+        };
+      },
+    };
+    const datasource = createViewportDatasource(collection, {
+      storeId: "immediate-refresh",
+      queryDebounceMs: 200,
+    });
+
+    datasource.init({
+      api: {
+        getFilterModel: () => ({}),
+        getColumnState: () =>
+          [
+            {
+              colId: "athlete",
+              sort: "asc",
+              sortIndex: 0,
+            },
+          ] as ReadonlyArray<ColumnState>,
+      } as never,
+      context: {} as never,
+      setRowCount: vi.fn(),
+      setRowData: vi.fn(),
+      getRow: vi.fn(),
+    } as IViewportDatasourceParams<RowRecord>);
+
+    await waitFor(() => (openCalls > 0 ? openCalls : undefined));
+    datasource.refreshQuery();
+    await waitFor(() => (replaceCalls.length > 0 ? replaceCalls.length : undefined));
+
+    expect(replaceCalls).toHaveLength(1);
+    expect(replaceCalls[0]).toEqual({
+      predicate: null,
+      sorts: [{ field: "athlete", direction: "asc" }],
+    });
+
+    datasource.destroy?.();
   });
 });

@@ -60,9 +60,9 @@ export type BufferedCollection<T extends object, TKey extends string | number> =
   DirectWriteCollectionUtils<T, TKey>
 >;
 
-interface QueryWindowOptions {
-  offset?: number;
-  limit?: number;
+export interface QueryWindowOptions {
+  startRow?: number;
+  endRow?: number;
 }
 
 function getFieldRef(row: Record<string, unknown>, field: string) {
@@ -179,8 +179,10 @@ function applyWindow(
   queryState: GridQueryState,
   options?: QueryWindowOptions,
 ) {
-  const offset = options?.offset ?? 0;
-  const limit = options?.limit;
+  const offset = options?.startRow ?? 0;
+  const limit = options?.endRow === undefined
+    ? undefined
+    : Math.max(0, options.endRow - offset);
 
   if (offset <= 0 && limit === undefined) {
     return builder;
@@ -497,24 +499,70 @@ export function createQueryCollection(
   });
 }
 
+function toRowCountQueryState(queryState: GridQueryState): GridQueryState {
+  return {
+    predicate: queryState.predicate,
+    sorts: [],
+  };
+}
+
+export function createRowCountCollection(
+  rowsCollection: Collection<RowRecord, string>,
+  queryState: GridQueryState,
+) {
+  return createQueryCollection(rowsCollection, toRowCountQueryState(queryState));
+}
+
+export function collectWindowRows<T extends object>(
+  collection: {
+    values(): IterableIterator<T>;
+  },
+  range: {
+    startRow: number;
+    endRow: number;
+  },
+) {
+  const rows: Array<T> = [];
+  let index = 0;
+
+  for (const row of collection.values()) {
+    if (index >= range.endRow) {
+      break;
+    }
+
+    if (index >= range.startRow) {
+      rows.push(row);
+    }
+
+    index += 1;
+  }
+
+  return rows;
+}
+
 export async function executeGridQuery(
   rowsCollection: Collection<RowRecord, string>,
   queryState: GridQueryState,
   options?: {
-    offset?: number;
-    limit?: number;
+    startRow?: number;
+    endRow?: number;
   },
 ) {
-  const rowCountCollection = createQueryCollection(rowsCollection, queryState);
-  const windowCollection = createQueryCollection(rowsCollection, queryState, options);
+  const rowCountCollection = createRowCountCollection(rowsCollection, queryState);
+  const queryCollection = createQueryCollection(rowsCollection, queryState);
 
   await Promise.all([
     rowCountCollection.preload(),
-    windowCollection.preload(),
+    queryCollection.preload(),
   ]);
 
   return {
     rowCount: rowCountCollection.size,
-    rows: asRowRecords(windowCollection.toArray),
+    rows: asRowRecords(
+      collectWindowRows(queryCollection, {
+        startRow: options?.startRow ?? 0,
+        endRow: options?.endRow ?? rowCountCollection.size,
+      }),
+    ),
   };
 }

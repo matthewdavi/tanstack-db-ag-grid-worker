@@ -26,7 +26,14 @@ import type {
   ViewportPatch,
 } from "./worker-contract";
 import { createDemoRowFactory, generateDemoRows } from "./demo-data";
-import { createQueryCollection, createRowCollection, executeGridQuery, type RowRecord } from "./query-runtime";
+import {
+  collectWindowRows,
+  createQueryCollection,
+  createRowCountCollection,
+  createRowCollection,
+  executeGridQuery,
+  type RowRecord,
+} from "./query-runtime";
 const DEFAULT_STRESS_TICK_MS = 100;
 
 interface StoreEntry {
@@ -41,6 +48,7 @@ interface ViewportSessionState {
   readonly sessionId: string;
   readonly storeId: string;
   readonly queue: Queue.Queue<ViewportPatch>;
+  request: ViewportRequest;
   revision: number;
   closed: boolean;
 }
@@ -52,7 +60,8 @@ interface ViewportRequest {
 }
 
 interface ViewportSessionBinding {
-  readonly request: ViewportRequest;
+  readonly queryKey: string;
+  publish(triggeredAtMs: number | null): Effect.Effect<void>;
 }
 
 interface ViewportSessionEntry {
@@ -119,8 +128,8 @@ export class StoreRegistry {
   ): Promise<SsrmBlockResponse> {
     const entry = this.requireStore(storeId);
     const snapshot = await executeGridQuery(entry.collection, query, {
-      offset: range.startRow,
-      limit: Math.max(0, range.endRow - range.startRow),
+      startRow: range.startRow,
+      endRow: range.endRow,
     });
 
     return {
@@ -207,16 +216,22 @@ export class StoreRegistry {
         catch: (error) =>
           error instanceof Error ? error.message : "Unknown viewport session",
       });
-      session.state.revision += 1;
+      session.state.request = {
+        startRow: request.startRow,
+        endRow: request.endRow,
+        query: request.query,
+      };
 
-      yield* ScopedRef.set(
-        session.bindingRef,
-        self.makeViewportBinding(session.state, {
-          startRow: request.startRow,
-          endRow: request.endRow,
-          query: request.query,
-        }),
-      );
+      const binding = yield* ScopedRef.get(session.bindingRef);
+      if (binding.queryKey === self.toQueryKey(request.query)) {
+        yield* binding.publish(null);
+      } else {
+        session.state.revision += 1;
+        yield* ScopedRef.set(
+          session.bindingRef,
+          self.makeViewportBinding(session.state, request.query),
+        );
+      }
 
       return {
         sessionId: request.sessionId,
@@ -315,16 +330,17 @@ export class StoreRegistry {
         sessionId: request.sessionId,
         storeId: request.storeId,
         queue,
+        request: {
+          startRow: request.startRow,
+          endRow: request.endRow,
+          query: request.query,
+        },
         revision: 1,
         closed: false,
       };
       const bindingRef = yield* Scope.extend(
         ScopedRef.fromAcquire(
-          self.makeViewportBinding(state, {
-            startRow: request.startRow,
-            endRow: request.endRow,
-            query: request.query,
-          }),
+          self.makeViewportBinding(state, request.query),
         ),
         scope,
       );
@@ -341,15 +357,13 @@ export class StoreRegistry {
 
   private makeViewportBinding(
     session: ViewportSessionState,
-    request: ViewportRequest,
+    query: GridQueryState,
   ): Effect.Effect<ViewportSessionBinding, string, Scope.Scope> {
     const revision = session.revision;
     const store = this.requireStore(session.storeId);
-    const rowCountCollection = createQueryCollection(store.collection, request.query);
-    const windowCollection = createQueryCollection(store.collection, request.query, {
-      offset: request.startRow,
-      limit: Math.max(0, request.endRow - request.startRow),
-    });
+    const rowCountCollection = createRowCountCollection(store.collection, query);
+    const queryCollection = createQueryCollection(store.collection, query);
+    const queryKey = this.toQueryKey(query);
 
     return Effect.gen(this, function* () {
       const runtime = (yield* Effect.withFiberRuntime((fiber, status) =>
@@ -361,18 +375,25 @@ export class StoreRegistry {
           }),
         ),
       )) as Runtime.Runtime<any>;
-      const bindingRequest: ViewportSessionBinding["request"] = request;
-
       return yield* Effect.acquireRelease(
         Effect.tryPromise({
           try: async () => {
             await Promise.all([
               rowCountCollection.preload(),
-              windowCollection.preload(),
+              queryCollection.preload(),
             ]);
 
             let publishScheduled = false;
             let scheduledPatchAtMs: number | null = null;
+            const publish = (triggeredAtMs: number | null) =>
+              this.publishViewportPatch(
+                runtime,
+                session,
+                revision,
+                rowCountCollection,
+                queryCollection,
+                triggeredAtMs,
+              );
             const schedulePublish = () => {
               if (publishScheduled) {
                 return;
@@ -386,51 +407,37 @@ export class StoreRegistry {
                 scheduledPatchAtMs = null;
                 void Runtime.runPromise(
                   runtime,
-                  this.publishViewportPatch(
-                    runtime,
-                    session,
-                    revision,
-                    bindingRequest,
-                    rowCountCollection,
-                    windowCollection,
-                    triggeredAtMs,
-                  ),
+                  publish(triggeredAtMs),
                 );
               });
             };
 
             await Runtime.runPromise(
               runtime,
-              this.publishViewportPatch(
-                runtime,
-                session,
-                revision,
-                bindingRequest,
-                rowCountCollection,
-                windowCollection,
-                null,
-              ),
+              publish(null),
             );
             const rowCountSubscription = rowCountCollection.subscribeChanges(schedulePublish);
-            const windowSubscription = windowCollection.subscribeChanges(schedulePublish);
+            const querySubscription = queryCollection.subscribeChanges(schedulePublish);
 
             return {
-              request: bindingRequest,
+              queryKey,
               rowCountSubscription,
-              windowSubscription,
+              querySubscription,
+              publish,
             };
           },
           catch: (error) =>
             error instanceof Error ? error.message : "Failed to preload viewport session",
         }),
-        ({ rowCountSubscription, windowSubscription }) =>
+        ({ rowCountSubscription, querySubscription }) =>
           Effect.sync(() => {
             rowCountSubscription.unsubscribe();
-            windowSubscription.unsubscribe();
+            querySubscription.unsubscribe();
           }),
       ).pipe(
-        Effect.map(({ request }) => ({
-          request,
+        Effect.map(({ queryKey, publish }) => ({
+          queryKey,
+          publish,
         })),
       );
     });
@@ -440,15 +447,15 @@ export class StoreRegistry {
     runtime: Runtime.Runtime<any>,
     session: ViewportSessionState,
     revision: number,
-    request: ViewportSessionBinding["request"],
     rowCountCollection: ReturnType<typeof createQueryCollection>,
-    windowCollection: ReturnType<typeof createQueryCollection>,
+    queryCollection: ReturnType<typeof createQueryCollection>,
     triggeredAtMs: number | null,
   ) {
     if (session.closed || revision !== session.revision || !session.queue.isActive()) {
       return Effect.void;
     }
 
+    const request = session.request;
     return Effect.sync(() => Runtime.runSync(runtime, Clock.currentTimeMillis)).pipe(
       Effect.flatMap((emittedAtMs) =>
         Queue.offer(session.queue, {
@@ -458,11 +465,15 @@ export class StoreRegistry {
           rowCount: rowCountCollection.size,
           latencyMs: triggeredAtMs === null ? 0 : Math.max(0, emittedAtMs - triggeredAtMs),
           metrics: this.requireStore(session.storeId).collection.utils.getMetrics(),
-          rows: windowCollection.toArray as unknown as ReadonlyArray<RowRecord>,
+          rows: collectWindowRows(queryCollection, request) as unknown as ReadonlyArray<RowRecord>,
         }).pipe(
           Effect.catchAll(() => Effect.void),
         )),
     );
+  }
+
+  private toQueryKey(query: GridQueryState) {
+    return JSON.stringify(query);
   }
 
   private requireStore(storeId: string): StoreEntry {

@@ -43,6 +43,7 @@ export interface ViewportDiagnostics {
     endRow: number;
   } | null;
   requestVersion: number;
+  isLoading: boolean;
   lastPatchLatencyMs: number | null;
   ignoredPatchCount: number;
   patchCount: number;
@@ -50,6 +51,7 @@ export interface ViewportDiagnostics {
 
 const INITIAL_VIEWPORT_ROW_COUNT = 50;
 const DEFAULT_QUERY_DEBOUNCE_MS = 200;
+type ViewportRefreshKind = "range" | "query";
 
 function columnStateToSortModel(
   columnState: ReadonlyArray<ColumnState>,
@@ -140,7 +142,9 @@ export function createServerSideDatasource<TData extends RowRecord = RowRecord>(
 }
 
 export interface ViewportDatasourceHandle extends IViewportDatasource {
-  refreshQuery(): void;
+  refreshQuery(options?: {
+    debounce?: boolean;
+  }): void;
 }
 
 export function createViewportDatasource<TData extends RowRecord = RowRecord>(
@@ -155,6 +159,7 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
   let lifecycleVersion = 0;
   let patchCount = 0;
   let ignoredPatchCount = 0;
+  let isLoading = true;
   let lastPatchLatencyMs: number | null = null;
   const queryDebounceMs = options.queryDebounceMs ?? DEFAULT_QUERY_DEBOUNCE_MS;
   let viewportRange = {
@@ -169,10 +174,16 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
       requestedRange: { ...viewportRange },
       fulfilledRange,
       requestVersion: lifecycleVersion,
+      isLoading,
       lastPatchLatencyMs,
       ignoredPatchCount,
       patchCount,
     });
+  };
+
+  const beginLoading = () => {
+    isLoading = true;
+    emitDiagnostics();
   };
 
   const closeActiveResources = async () => {
@@ -213,6 +224,7 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     },
   ) => {
     patchCount += 1;
+    isLoading = false;
     lastPatchLatencyMs = patch.latencyMs;
     options.onSnapshot?.({
       startRow: patch.startRow,
@@ -283,12 +295,13 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     return startPromise;
   };
 
-  const syncViewportQuery = async () => {
+  const syncViewportQuery = async (kind: ViewportRefreshKind) => {
     if (params === null) {
       return;
     }
 
     if (viewportSession === null) {
+      beginLoading();
       await startViewportSession(params);
       return;
     }
@@ -300,6 +313,9 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
       }
     }
 
+    if (kind === "query") {
+      beginLoading();
+    }
     await viewportSession.replace({
       startRow: viewportRange.startRow,
       endRow: viewportRange.endRow,
@@ -314,20 +330,19 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     }
 
     if (queryDebounceMs <= 0) {
-      void syncViewportQuery().catch(() => undefined);
+      void syncViewportQuery("query").catch(() => undefined);
       return;
     }
 
     queryRefreshHandle = setTimeout(() => {
       queryRefreshHandle = null;
-      void syncViewportQuery().catch(() => undefined);
+      void syncViewportQuery("query").catch(() => undefined);
     }, queryDebounceMs);
   };
 
   return {
     init(nextParams) {
       params = nextParams;
-      emitDiagnostics();
       void startViewportSession(nextParams).catch(() => undefined);
     },
     setViewportRange(firstRow, lastRow) {
@@ -339,12 +354,19 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
         startRow: firstRow,
         endRow: lastRow + 1,
       };
-      emitDiagnostics();
-      void syncViewportQuery().catch(() => undefined);
+      void syncViewportQuery("range").catch(() => undefined);
     },
-    refreshQuery() {
-      emitDiagnostics();
-      scheduleViewportQueryRefresh();
+    refreshQuery(options) {
+      if (options?.debounce) {
+        scheduleViewportQueryRefresh();
+        return;
+      }
+
+      if (queryRefreshHandle !== null) {
+        clearTimeout(queryRefreshHandle);
+        queryRefreshHandle = null;
+      }
+      void syncViewportQuery("query").catch(() => undefined);
     },
     destroy() {
       lifecycleVersion += 1;
