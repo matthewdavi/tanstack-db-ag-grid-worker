@@ -64,6 +64,7 @@ export const ViewportPatchSchema = Schema.Struct({
   startRow: Schema.Number,
   endRow: Schema.Number,
   rowCount: Schema.Number,
+  latencyMs: Schema.Number,
   metrics: StoreMetricsSchema,
   rows: Schema.Array(RowRecordSchema),
 }) as Schema.Schema<ViewportPatch>;
@@ -277,11 +278,19 @@ export interface ViewportPatch {
   startRow: number;
   endRow: number;
   rowCount: number;
+  latencyMs: number;
   metrics: StoreMetrics;
   rows: ReadonlyArray<RowRecord>;
 }
 
-export interface SsrmBlockResponse extends ViewportPatch {}
+export interface SsrmBlockResponse {
+  storeId: string;
+  startRow: number;
+  endRow: number;
+  rowCount: number;
+  metrics: StoreMetrics;
+  rows: ReadonlyArray<RowRecord>;
+}
 
 export type StoreTransaction =
   | {

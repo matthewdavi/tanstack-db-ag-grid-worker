@@ -11,17 +11,18 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "bun run demo:dev",
-    "demo:dev": "cd apps/demo && ../../node_modules/.bin/vite",
-    "build": "bun run typecheck && bun run demo:build",
-    "bench:collection": "bun run packages/worker-store/scripts/stress-collection.ts",
-    "demo:build": "cd apps/demo && ../../node_modules/.bin/vite build",
-    "test": "./node_modules/.bin/vitest run",
-    "test:watch": "./node_modules/.bin/vitest",
-    "typecheck": "./node_modules/.bin/tsc -p tsconfig.typecheck.json --noEmit",
-    "check": "bun run typecheck && bun run test"
+    "dev": "turbo dev --filter=@sandbox/demo",
+    "dev:demo": "turbo dev --filter=@sandbox/demo",
+    "build": "turbo build",
+    "build:demo": "turbo build --filter=@sandbox/demo",
+    "test": "turbo test",
+    "test:watch": "vitest --root .",
+    "typecheck": "turbo typecheck",
+    "check": "turbo run build typecheck test",
+    "bench:collection": "bun run packages/worker-store/scripts/stress-collection.ts"
   },
   "devDependencies": {
+    "@effect/vitest": "^0.28.0",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
     "@types/node": "^24.5.2",
@@ -29,6 +30,7 @@
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.2",
     "jsdom": "^27.0.0",
+    "turbo": "^2.8.19",
     "typescript": "^5.9.3",
     "vite": "^7.1.7",
     "vitest": "^4.0.0"

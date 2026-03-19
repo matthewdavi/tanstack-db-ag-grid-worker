@@ -76,10 +76,6 @@ function toViewportRows(
   );
 }
 
-function nowMs() {
-  return typeof performance !== "undefined" ? performance.now() : Date.now();
-}
-
 function isUnsupportedServerSideRequest(
   params: IServerSideGetRowsParams,
 ): boolean {
@@ -161,7 +157,6 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
   let ignoredPatchCount = 0;
   let lastPatchLatencyMs: number | null = null;
   const queryDebounceMs = options.queryDebounceMs ?? DEFAULT_QUERY_DEBOUNCE_MS;
-  let requestedRangeStartedAt = nowMs();
   let viewportRange = {
     startRow: 0,
     endRow: INITIAL_VIEWPORT_ROW_COUNT,
@@ -212,12 +207,13 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
       startRow: number;
       endRow: number;
       rowCount: number;
+      latencyMs: number;
       metrics: StoreMetrics;
       rows: ReadonlyArray<RowRecord>;
     },
   ) => {
     patchCount += 1;
-    lastPatchLatencyMs = nowMs() - requestedRangeStartedAt;
+    lastPatchLatencyMs = patch.latencyMs;
     options.onSnapshot?.({
       startRow: patch.startRow,
       endRow: patch.endRow,
@@ -331,7 +327,6 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
   return {
     init(nextParams) {
       params = nextParams;
-      requestedRangeStartedAt = nowMs();
       emitDiagnostics();
       void startViewportSession(nextParams).catch(() => undefined);
     },
@@ -344,12 +339,10 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
         startRow: firstRow,
         endRow: lastRow + 1,
       };
-      requestedRangeStartedAt = nowMs();
       emitDiagnostics();
       void syncViewportQuery().catch(() => undefined);
     },
     refreshQuery() {
-      requestedRangeStartedAt = nowMs();
       emitDiagnostics();
       scheduleViewportQueryRefresh();
     },

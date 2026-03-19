@@ -337,6 +337,7 @@ describe("ag-grid worker adapters", () => {
         startRow: number;
         endRow: number;
         rowCount: number;
+        latencyMs: number;
         metrics: {
           lastCommitDurationMs: number | null;
           lastCommitChangeCount: number;
@@ -359,6 +360,7 @@ describe("ag-grid worker adapters", () => {
             startRow: request.startRow,
             endRow: request.endRow,
             rowCount: rows.length,
+            latencyMs: 0,
             metrics: {
               lastCommitDurationMs: 1,
               lastCommitChangeCount: 20,
@@ -382,6 +384,7 @@ describe("ag-grid worker adapters", () => {
                 startRow: nextRequest.startRow,
                 endRow: nextRequest.endRow,
                 rowCount: rows.length,
+                latencyMs: 0,
                 metrics: {
                   lastCommitDurationMs: 2,
                   lastCommitChangeCount: 20,
@@ -452,6 +455,93 @@ describe("ag-grid worker adapters", () => {
       endRow: 40,
     });
     expect(fulfilledDiagnostics.lastPatchLatencyMs).not.toBeNull();
+  });
+
+  it("measures viewport latency from patch emission time instead of request age", async () => {
+    const queue = await Effect.runPromise(
+      Queue.unbounded<{
+        storeId: string;
+        startRow: number;
+        endRow: number;
+        rowCount: number;
+        latencyMs: number;
+        metrics: {
+          lastCommitDurationMs: number | null;
+          lastCommitChangeCount: number;
+          totalCommitCount: number;
+        };
+        rows: ReadonlyArray<RowRecord>;
+      }>(),
+    );
+
+    try {
+      const collection = {
+        storeId: "latency",
+        openViewportSession: (request: {
+          startRow: number;
+          endRow: number;
+          query: GridQueryState;
+          sessionId?: string;
+        }) => ({
+          sessionId: request.sessionId ?? "latency-session",
+          updates: Stream.fromQueue(queue),
+          replace: async () => ({
+            sessionId: "latency-session",
+            replaced: true,
+          }),
+          close: async () => {
+            await Effect.runPromise(Queue.shutdown(queue));
+            return {
+              sessionId: "latency-session",
+              closed: true,
+            };
+          },
+        }),
+      };
+
+      let lastLatency: number | null = null;
+      const datasource = createViewportDatasource(collection, {
+        storeId: "latency",
+        onViewportDiagnostics: (diagnostics) => {
+          lastLatency = diagnostics.lastPatchLatencyMs;
+        },
+      });
+
+      datasource.init({
+        api: {
+          getFilterModel: () => ({}),
+          getColumnState: () => [] as ReadonlyArray<ColumnState>,
+        } as never,
+        context: {} as never,
+        setRowCount: vi.fn(),
+        setRowData: vi.fn(),
+        getRow: vi.fn(),
+      } as IViewportDatasourceParams<RowRecord>);
+
+      await Effect.runPromise(
+        Queue.offer(queue, {
+          storeId: "latency",
+          startRow: 0,
+          endRow: 50,
+          rowCount: 1,
+          latencyMs: 25,
+          metrics: {
+            lastCommitDurationMs: 1,
+            lastCommitChangeCount: 1,
+            totalCommitCount: 1,
+          },
+          rows: [{ id: "1", athlete: "Latency" }],
+        } as never),
+      );
+
+      const latency = await waitFor(() =>
+        lastLatency === null ? undefined : lastLatency,
+      );
+
+      expect(latency).toBe(25);
+    } finally {
+      await Effect.runPromise(Queue.shutdown(queue));
+    }
   });
 
   it("coalesces rapid refreshes into one latest-only viewport replace", async () => {

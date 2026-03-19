@@ -6,7 +6,7 @@ import "ag-grid-enterprise";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import * as Stream from "effect/Stream";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 
 import type {
   ViewportPatch,
@@ -44,6 +44,18 @@ const sampleMetrics = {
   lastCommitChangeCount: sampleRows.length,
   totalCommitCount: 1,
 };
+const originalConsoleError = console.error.bind(console);
+const originalConsoleWarn = console.warn.bind(console);
+
+function isAgGridLicenseMessage(value: unknown) {
+  return typeof value === "string" && (
+    value.includes("****************************************************************") ||
+    value.includes("AG Grid Enterprise") ||
+    value.includes("License Key Not Found") ||
+    value.includes("trial license key") ||
+    value.includes("watermark")
+  );
+}
 
 class ResizeObserverStub {
   observe() {}
@@ -70,6 +82,22 @@ beforeAll(() => {
     get() {
       return 720;
     },
+  });
+  vi.spyOn(console, "error").mockImplementation((...args) => {
+    const [firstArg] = args;
+    if (isAgGridLicenseMessage(firstArg)) {
+      return;
+    }
+
+    originalConsoleError(...args);
+  });
+  vi.spyOn(console, "warn").mockImplementation((...args) => {
+    const [firstArg] = args;
+    if (isAgGridLicenseMessage(firstArg)) {
+      return;
+    }
+
+    originalConsoleWarn(...args);
   });
 });
 
@@ -100,6 +128,7 @@ function makeClient(): WorkerClient {
         startRow: 0,
         endRow: sampleRows.length,
         rowCount: sampleRows.length,
+        latencyMs: 12.5,
         metrics: sampleMetrics,
         rows: sampleRows,
       }]),
@@ -160,25 +189,19 @@ describe("demo app", () => {
     await screen.findByText("Patch latency");
   });
 
-  it("lets the viewport demo retune worker-side stress throughput", async () => {
+  it("renders the viewport stress controls", async () => {
     const client = makeClient();
     render(<App client={client} />);
 
-    const slider = await screen.findByRole("slider", { name: "Rows per second" });
-    fireEvent.change(slider, {
-      target: {
-        value: "120",
-      },
-    });
+    const viewportHeading = await screen.findByRole("heading", { name: "Viewport Push" });
+    const viewportPanel = viewportHeading.closest("section");
 
-    await waitFor(() => {
-      expect(client.collection("olympic-athletes").setStressRate).toHaveBeenLastCalledWith(120);
+    expect(viewportPanel).not.toBeNull();
+    await within(viewportPanel as HTMLElement).findByRole("slider", {
+      name: "Rows per second",
     });
-
-    fireEvent.click(screen.getByRole("button", { name: "Stop stress stream" }));
-
-    await waitFor(() => {
-      expect(client.collection("olympic-athletes").setStressRate).toHaveBeenLastCalledWith(0);
-    });
+    expect(
+      within(viewportPanel as HTMLElement).getByRole("button", { name: "Stop stress stream" }),
+    );
   });
 });

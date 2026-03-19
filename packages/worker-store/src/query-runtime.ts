@@ -33,17 +33,18 @@ export interface RowCollectionOptions {
   id: string;
   getKey?: (row: RowRecord) => string;
   rows?: ReadonlyArray<RowRecord>;
-  commitDebounceMs?: number;
 }
 
-export interface BufferedCollectionUtils<T extends object, TKey extends string | number> {
-  writeChanges(
-    changes: ReadonlyArray<ChangeMessageOrDeleteKeyMessage<T, TKey>>,
-    options?: {
-      immediate?: boolean;
-    },
-  ): void;
-  flushChanges(): void;
+type MaybeMany<T> = T | ReadonlyArray<T>;
+
+type DirectWriteUpdate<T extends object> = Partial<T>;
+
+export interface DirectWriteCollectionUtils<T extends object, TKey extends string | number> {
+  writeBatch(callback: () => void): void;
+  writeInsert(data: MaybeMany<T>): void;
+  writeUpdate(data: MaybeMany<DirectWriteUpdate<T>>): void;
+  writeUpsert(data: MaybeMany<T>): void;
+  writeDelete(keys: MaybeMany<TKey>): void;
   getMetrics(): BufferedCollectionMetrics;
 }
 
@@ -56,7 +57,7 @@ export interface BufferedCollectionMetrics {
 export type BufferedCollection<T extends object, TKey extends string | number> = Collection<
   T,
   TKey,
-  BufferedCollectionUtils<T, TKey>
+  DirectWriteCollectionUtils<T, TKey>
 >;
 
 interface QueryWindowOptions {
@@ -209,7 +210,6 @@ export function createRowCollection(options: RowCollectionOptions) {
       id: options.id,
       getKey: options.getKey ?? ((row) => row.id),
       initialData: [...(options.rows ?? [])],
-      commitDebounceMs: options.commitDebounceMs,
     }),
   );
 }
@@ -218,23 +218,35 @@ function bufferedLocalCollectionOptions<T extends object, TKey extends string | 
   id: string;
   getKey: (row: T) => TKey;
   initialData?: ReadonlyArray<T>;
-  commitDebounceMs?: number;
-}): CollectionConfig<T, TKey, never, BufferedCollectionUtils<T, TKey>> {
+}): CollectionConfig<T, TKey, never, DirectWriteCollectionUtils<T, TKey>> {
   const baseOptions = localOnlyCollectionOptions<T, TKey>({
     id: config.id,
     getKey: config.getKey,
     initialData: [],
   });
-  const commitDebounceMs = config.commitDebounceMs ?? 100;
-  let pendingChanges: Array<ChangeMessageOrDeleteKeyMessage<T, TKey>> = [];
-  let flushHandle: ReturnType<typeof setTimeout> | null = null;
   let metrics: BufferedCollectionMetrics = {
     lastCommitDurationMs: null,
     lastCommitChangeCount: 0,
     totalCommitCount: 0,
   };
+  type DirectWriteOperation =
+    | {
+        type: "insert" | "upsert";
+        value: T;
+      }
+    | {
+        type: "update";
+        value: DirectWriteUpdate<T>;
+      }
+    | {
+        type: "delete";
+        key: TKey;
+      };
+  let pendingOperations: Array<DirectWriteOperation> = [];
+  let batchDepth = 0;
   let syncState:
     | {
+        collection: Collection<T, TKey>;
         begin: Parameters<SyncConfig<T, TKey>["sync"]>[0]["begin"];
         write: Parameters<SyncConfig<T, TKey>["sync"]>[0]["write"];
         commit: Parameters<SyncConfig<T, TKey>["sync"]>[0]["commit"];
@@ -242,20 +254,97 @@ function bufferedLocalCollectionOptions<T extends object, TKey extends string | 
       }
     | null = null;
 
-  const flushPendingChanges = () => {
-    if (flushHandle !== null) {
-      clearTimeout(flushHandle);
-      flushHandle = null;
+  const asArray = <TItem>(data: MaybeMany<TItem>) =>
+    Array.isArray(data) ? data : [data];
+
+  const getCurrentValue = (
+    shadow: Map<TKey, T | undefined>,
+    key: TKey,
+  ) => {
+    if (shadow.has(key)) {
+      return shadow.get(key);
     }
 
-    if (syncState === null || pendingChanges.length === 0) {
+    return syncState?.collection.get(key);
+  };
+
+  const materializeOperations = (
+    operations: ReadonlyArray<DirectWriteOperation>,
+  ): Array<ChangeMessageOrDeleteKeyMessage<T, TKey>> => {
+    const shadow = new Map<TKey, T | undefined>();
+    const changes: Array<ChangeMessageOrDeleteKeyMessage<T, TKey>> = [];
+
+    for (const operation of operations) {
+      switch (operation.type) {
+        case "insert": {
+          const key = config.getKey(operation.value);
+          shadow.set(key, operation.value);
+          changes.push({
+            type: "insert",
+            value: operation.value,
+          });
+          break;
+        }
+        case "update": {
+          const key = config.getKey(operation.value as T);
+          const current = getCurrentValue(shadow, key);
+          if (current === undefined) {
+            break;
+          }
+
+          const nextValue = {
+            ...current,
+            ...operation.value,
+          } as T;
+          shadow.set(key, nextValue);
+          changes.push({
+            type: "update",
+            value: nextValue,
+          });
+          break;
+        }
+        case "upsert": {
+          const key = config.getKey(operation.value);
+          const current = getCurrentValue(shadow, key);
+          const nextValue = current === undefined
+            ? operation.value
+            : ({
+                ...current,
+                ...operation.value,
+              } as T);
+
+          shadow.set(key, nextValue);
+          changes.push({
+            type: current === undefined ? "insert" : "update",
+            value: nextValue,
+          });
+          break;
+        }
+        case "delete": {
+          if (getCurrentValue(shadow, operation.key) === undefined) {
+            break;
+          }
+
+          shadow.set(operation.key, undefined);
+          changes.push({
+            type: "delete",
+            key: operation.key,
+          });
+          break;
+        }
+      }
+    }
+
+    return changes;
+  };
+
+  const commitChanges = (changes: ReadonlyArray<ChangeMessageOrDeleteKeyMessage<T, TKey>>) => {
+    if (syncState === null || changes.length === 0) {
       return;
     }
 
-    const changes = pendingChanges;
-    pendingChanges = [];
     const startedAt = nowMs();
-    syncState.begin();
+    syncState.begin({ immediate: true });
     for (const change of changes) {
       syncState.write(change);
     }
@@ -267,44 +356,89 @@ function bufferedLocalCollectionOptions<T extends object, TKey extends string | 
     };
   };
 
-  const scheduleFlush = () => {
-    if (flushHandle !== null) {
+  const flushPendingOperations = () => {
+    if (syncState === null || pendingOperations.length === 0) {
       return;
     }
 
-    if (commitDebounceMs <= 0) {
-      flushPendingChanges();
-      return;
-    }
-
-    flushHandle = setTimeout(() => {
-      flushHandle = null;
-      flushPendingChanges();
-    }, commitDebounceMs);
+    const operations = pendingOperations;
+    pendingOperations = [];
+    commitChanges(materializeOperations(operations));
   };
 
   return {
     ...baseOptions,
     utils: {
       ...baseOptions.utils,
-      writeChanges(changes, options) {
-        pendingChanges.push(...changes);
-        if (options?.immediate) {
-          flushPendingChanges();
-          return;
+      writeBatch(callback) {
+        const savepoint = pendingOperations.length;
+        batchDepth += 1;
+
+        try {
+          callback();
+        } catch (error) {
+          pendingOperations.length = savepoint;
+          batchDepth -= 1;
+          throw error;
         }
-        scheduleFlush();
+
+        batchDepth -= 1;
+        if (batchDepth === 0) {
+          flushPendingOperations();
+        }
       },
-      flushChanges() {
-        flushPendingChanges();
+      writeInsert(data) {
+        pendingOperations.push(
+          ...asArray(data).map((value) => ({
+            type: "insert" as const,
+            value,
+          })),
+        );
+        if (batchDepth === 0) {
+          flushPendingOperations();
+        }
+      },
+      writeUpdate(data) {
+        pendingOperations.push(
+          ...asArray(data).map((value) => ({
+            type: "update" as const,
+            value,
+          })),
+        );
+        if (batchDepth === 0) {
+          flushPendingOperations();
+        }
+      },
+      writeUpsert(data) {
+        pendingOperations.push(
+          ...asArray(data).map((value) => ({
+            type: "upsert" as const,
+            value,
+          })),
+        );
+        if (batchDepth === 0) {
+          flushPendingOperations();
+        }
+      },
+      writeDelete(keys) {
+        pendingOperations.push(
+          ...asArray(keys).map((key) => ({
+            type: "delete" as const,
+            key,
+          })),
+        );
+        if (batchDepth === 0) {
+          flushPendingOperations();
+        }
       },
       getMetrics() {
         return metrics;
       },
     },
     sync: {
-      sync({ begin, write, commit, markReady }) {
+      sync({ collection, begin, write, commit, markReady }) {
         syncState = {
+          collection,
           begin,
           write,
           commit,
@@ -328,15 +462,12 @@ function bufferedLocalCollectionOptions<T extends object, TKey extends string | 
           };
         }
 
-        flushPendingChanges();
+        flushPendingOperations();
         markReady();
 
         return () => {
-          if (flushHandle !== null) {
-            clearTimeout(flushHandle);
-            flushHandle = null;
-          }
-          pendingChanges = [];
+          pendingOperations = [];
+          batchDepth = 0;
           syncState = null;
         };
       },

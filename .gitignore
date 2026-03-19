@@ -1,4 +1,5 @@
 node_modules
 dist
+.turbo
 packages/*/tsconfig.tsbuildinfo
 apps/*/tsconfig.tsbuildinfo

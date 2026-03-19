@@ -1,9 +1,11 @@
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Match from "effect/Match";
 import * as Queue from "effect/Queue";
+import * as Runtime from "effect/Runtime";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as ScopedRef from "effect/ScopedRef";
@@ -24,14 +26,7 @@ import type {
   ViewportPatch,
 } from "./worker-contract";
 import { createDemoRowFactory, generateDemoRows } from "./demo-data";
-import {
-  createQueryCollection,
-  createRowCollection,
-  executeGridQuery,
-  type RowRecord,
-} from "./query-runtime";
-
-const DEFAULT_COMMIT_DEBOUNCE_MS = 100;
+import { createQueryCollection, createRowCollection, executeGridQuery, type RowRecord } from "./query-runtime";
 const DEFAULT_STRESS_TICK_MS = 100;
 
 interface StoreEntry {
@@ -50,12 +45,14 @@ interface ViewportSessionState {
   closed: boolean;
 }
 
+interface ViewportRequest {
+  startRow: number;
+  endRow: number;
+  query: GridQueryState;
+}
+
 interface ViewportSessionBinding {
-  readonly request: {
-    startRow: number;
-    endRow: number;
-    query: GridQueryState;
-  };
+  readonly request: ViewportRequest;
 }
 
 interface ViewportSessionEntry {
@@ -64,18 +61,9 @@ interface ViewportSessionEntry {
   readonly bindingRef: ScopedRef.ScopedRef<ViewportSessionBinding>;
 }
 
-export interface StoreRegistryOptions {
-  commitDebounceMs?: number;
-}
-
 export class StoreRegistry {
   private readonly stores = new Map<string, StoreEntry>();
   private readonly viewportSessions = new Map<string, ViewportSessionEntry>();
-  private readonly commitDebounceMs: number;
-
-  constructor(options: StoreRegistryOptions = {}) {
-    this.commitDebounceMs = options.commitDebounceMs ?? DEFAULT_COMMIT_DEBOUNCE_MS;
-  }
 
   loadStore(definition: StoreDefinition, source: StoreSource) {
     const rows = Match.value(source).pipe(
@@ -102,7 +90,6 @@ export class StoreRegistry {
       id: definition.storeId,
       getKey: (row) => String(row[definition.rowKey] ?? row.id),
       rows,
-      commitDebounceMs: this.commitDebounceMs,
     });
 
     this.stores.set(definition.storeId, {
@@ -148,7 +135,17 @@ export class StoreRegistry {
 
   applyTransaction(storeId: string, transaction: StoreTransaction) {
     const entry = this.requireStore(storeId);
-    entry.collection.utils.writeChanges(this.toChangeMessages(entry, transaction));
+    entry.collection.utils.writeBatch(() => {
+      Match.value(transaction).pipe(
+        Match.when({ kind: "upsert" }, ({ rows }) => {
+          entry.collection.utils.writeUpsert(rows);
+        }),
+        Match.when({ kind: "delete" }, ({ ids }) => {
+          entry.collection.utils.writeDelete(ids);
+        }),
+        Match.exhaustive,
+      );
+    });
 
     return {
       storeId,
@@ -344,7 +341,7 @@ export class StoreRegistry {
 
   private makeViewportBinding(
     session: ViewportSessionState,
-    request: ViewportSessionBinding["request"],
+    request: ViewportRequest,
   ): Effect.Effect<ViewportSessionBinding, string, Scope.Scope> {
     const revision = session.revision;
     const store = this.requireStore(session.storeId);
@@ -354,127 +351,117 @@ export class StoreRegistry {
       limit: Math.max(0, request.endRow - request.startRow),
     });
 
-    return Effect.acquireRelease(
-      Effect.tryPromise({
-        try: async () => {
-          await Promise.all([
-            rowCountCollection.preload(),
-            windowCollection.preload(),
-          ]);
+    return Effect.gen(this, function* () {
+      const runtime = (yield* Effect.withFiberRuntime((fiber, status) =>
+        Effect.succeed(
+          Runtime.make({
+            context: fiber.currentDefaultServices,
+            runtimeFlags: status.runtimeFlags,
+            fiberRefs: fiber.getFiberRefs(),
+          }),
+        ),
+      )) as Runtime.Runtime<any>;
+      const bindingRequest: ViewportSessionBinding["request"] = request;
 
-          let publishScheduled = false;
-          const schedulePublish = () => {
-            if (publishScheduled) {
-              return;
-            }
+      return yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          try: async () => {
+            await Promise.all([
+              rowCountCollection.preload(),
+              windowCollection.preload(),
+            ]);
 
-            publishScheduled = true;
-            queueMicrotask(() => {
-              publishScheduled = false;
-              void Effect.runPromise(
-                this.publishViewportPatch(
-                  session,
-                  revision,
-                  request,
-                  rowCountCollection,
-                  windowCollection,
-                ),
-              );
-            });
-          };
+            let publishScheduled = false;
+            let scheduledPatchAtMs: number | null = null;
+            const schedulePublish = () => {
+              if (publishScheduled) {
+                return;
+              }
 
-          await Effect.runPromise(
-            this.publishViewportPatch(
-              session,
-              revision,
-              request,
-              rowCountCollection,
-              windowCollection,
-            ),
-          );
-          const rowCountSubscription = rowCountCollection.subscribeChanges(schedulePublish);
-          const windowSubscription = windowCollection.subscribeChanges(schedulePublish);
+              publishScheduled = true;
+              scheduledPatchAtMs = Runtime.runSync(runtime, Clock.currentTimeMillis);
+              queueMicrotask(() => {
+                publishScheduled = false;
+                const triggeredAtMs = scheduledPatchAtMs;
+                scheduledPatchAtMs = null;
+                void Runtime.runPromise(
+                  runtime,
+                  this.publishViewportPatch(
+                    runtime,
+                    session,
+                    revision,
+                    bindingRequest,
+                    rowCountCollection,
+                    windowCollection,
+                    triggeredAtMs,
+                  ),
+                );
+              });
+            };
 
-          return {
-            request,
-            rowCountSubscription,
-            windowSubscription,
-          };
-        },
-        catch: (error) =>
-          error instanceof Error ? error.message : "Failed to preload viewport session",
-      }),
-      ({ rowCountSubscription, windowSubscription }) =>
-        Effect.sync(() => {
-          rowCountSubscription.unsubscribe();
-          windowSubscription.unsubscribe();
+            await Runtime.runPromise(
+              runtime,
+              this.publishViewportPatch(
+                runtime,
+                session,
+                revision,
+                bindingRequest,
+                rowCountCollection,
+                windowCollection,
+                null,
+              ),
+            );
+            const rowCountSubscription = rowCountCollection.subscribeChanges(schedulePublish);
+            const windowSubscription = windowCollection.subscribeChanges(schedulePublish);
+
+            return {
+              request: bindingRequest,
+              rowCountSubscription,
+              windowSubscription,
+            };
+          },
+          catch: (error) =>
+            error instanceof Error ? error.message : "Failed to preload viewport session",
         }),
-    ).pipe(
-      Effect.map(({ request }) => ({
-        request,
-      })),
-    );
+        ({ rowCountSubscription, windowSubscription }) =>
+          Effect.sync(() => {
+            rowCountSubscription.unsubscribe();
+            windowSubscription.unsubscribe();
+          }),
+      ).pipe(
+        Effect.map(({ request }) => ({
+          request,
+        })),
+      );
+    });
   }
 
   private publishViewportPatch(
+    runtime: Runtime.Runtime<any>,
     session: ViewportSessionState,
     revision: number,
     request: ViewportSessionBinding["request"],
     rowCountCollection: ReturnType<typeof createQueryCollection>,
     windowCollection: ReturnType<typeof createQueryCollection>,
+    triggeredAtMs: number | null,
   ) {
     if (session.closed || revision !== session.revision || !session.queue.isActive()) {
       return Effect.void;
     }
 
-    return Queue.offer(session.queue, {
-      storeId: session.storeId,
-      startRow: request.startRow,
-      endRow: request.endRow,
-      rowCount: rowCountCollection.size,
-      metrics: this.requireStore(session.storeId).collection.utils.getMetrics(),
-      rows: windowCollection.toArray as unknown as ReadonlyArray<RowRecord>,
-    }).pipe(
-      Effect.asVoid,
-      Effect.catchAll(() => Effect.void),
-    );
-  }
-
-  private toChangeMessages(entry: StoreEntry, transaction: StoreTransaction) {
-    return Match.value(transaction).pipe(
-      Match.withReturnType<
-        Array<
-          | {
-              type: "delete";
-              key: string;
-            }
-          | {
-              type: "insert" | "update";
-              value: RowRecord;
-            }
-        >
-      >(),
-      Match.when({ kind: "upsert" }, ({ rows }) =>
-        rows.map((row) => {
-          const key = String(row[entry.definition.rowKey] ?? row.id);
-          return entry.collection.has(key)
-            ? {
-                type: "update" as const,
-                value: row,
-              }
-            : {
-                type: "insert" as const,
-                value: row,
-              };
-        }),
-      ),
-      Match.when({ kind: "delete" }, ({ ids }) =>
-        ids.map((id) => ({
-          type: "delete" as const,
-          key: id,
-        })),
-      ),
-      Match.exhaustive,
+    return Effect.sync(() => Runtime.runSync(runtime, Clock.currentTimeMillis)).pipe(
+      Effect.flatMap((emittedAtMs) =>
+        Queue.offer(session.queue, {
+          storeId: session.storeId,
+          startRow: request.startRow,
+          endRow: request.endRow,
+          rowCount: rowCountCollection.size,
+          latencyMs: triggeredAtMs === null ? 0 : Math.max(0, emittedAtMs - triggeredAtMs),
+          metrics: this.requireStore(session.storeId).collection.utils.getMetrics(),
+          rows: windowCollection.toArray as unknown as ReadonlyArray<RowRecord>,
+        }).pipe(
+          Effect.catchAll(() => Effect.void),
+        )),
     );
   }
 

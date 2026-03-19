@@ -461,6 +461,9 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
       .setStressRate(nextRowsPerSecond)
       .then(() => undefined);
   };
+  const handleStressInput = (value: string) => {
+    updateStressRate(Number(value));
+  };
 
   return (
     <GridCard
@@ -482,8 +485,8 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
             aria-label="Rows per second"
             max={2500}
             min={0}
-            onChange={(event) => {
-              updateStressRate(Number(event.target.value));
+            onInput={(event) => {
+              handleStressInput(event.currentTarget.value);
             }}
             step={10}
             type="range"

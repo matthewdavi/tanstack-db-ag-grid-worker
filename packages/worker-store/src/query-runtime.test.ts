@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { translateAdvancedFilter, translateColumnFilters } from "@sandbox/ag-grid-translator";
 
@@ -48,10 +48,6 @@ const rows = [
 ];
 
 describe("TanStack DB grid query runtime", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
   it("executes column filter translations against a TanStack DB collection", async () => {
     const collection = createRowCollection({
       id: "athletes",
@@ -158,13 +154,10 @@ describe("TanStack DB grid query runtime", () => {
     expect(results.rows.map((row) => row.id)).toEqual(["1", "3"]);
   });
 
-  it("batches sync writes through the custom collection creator before committing", async () => {
-    vi.useFakeTimers();
-
+  it("applies direct writes atomically through writeBatch", () => {
     const collection = createRowCollection({
       id: "batched",
       rows: [],
-      commitDebounceMs: 100,
     });
 
     const changes: Array<ReadonlyArray<{ type: string }>> = [];
@@ -172,29 +165,83 @@ describe("TanStack DB grid query runtime", () => {
       changes.push(nextChanges.map((change) => ({ type: change.type })));
     });
 
-    collection.utils.writeChanges([
-      {
-        type: "insert",
-        value: {
-          id: "batched-1",
-          athlete: "Queued",
-        },
-      },
-    ]);
+    collection.utils.writeBatch(() => {
+      collection.utils.writeInsert({
+        id: "batched-1",
+        athlete: "Queued",
+      });
+      collection.utils.writeInsert({
+        id: "batched-2",
+        athlete: "Replace me",
+      });
+      collection.utils.writeUpdate({
+        id: "batched-2",
+        athlete: "Updated",
+      });
+      collection.utils.writeDelete("batched-1");
+    });
 
-    expect(collection.size).toBe(0);
-    expect(changes).toHaveLength(0);
-
-    await vi.advanceTimersByTimeAsync(99);
-    expect(collection.size).toBe(0);
-    expect(changes).toHaveLength(0);
-
-    await vi.advanceTimersByTimeAsync(1);
     expect(collection.size).toBe(1);
     expect(changes).toHaveLength(1);
-    expect(changes[0]?.map((change) => change.type)).toEqual(["insert"]);
-    expect(collection.utils.getMetrics().lastCommitChangeCount).toBe(1);
+    expect(changes[0]).toHaveLength(1);
+    expect(collection.get("batched-1")).toBeUndefined();
+    expect(collection.get("batched-2")).toMatchObject({
+      id: "batched-2",
+      athlete: "Updated",
+    });
+    expect(collection.utils.getMetrics().lastCommitChangeCount).toBe(4);
     expect(collection.utils.getMetrics().totalCommitCount).toBeGreaterThan(0);
     expect(collection.utils.getMetrics().lastCommitDurationMs).not.toBeNull();
+  });
+
+  it("merges partial updates and collapses nested batches into one commit", () => {
+    const collection = createRowCollection({
+      id: "nested-batched",
+      rows: [
+        {
+          id: "batched-1",
+          athlete: "Queued",
+          country: "USA",
+          gold: 1,
+        },
+      ],
+    });
+
+    const changes: Array<ReadonlyArray<{ type: string }>> = [];
+    collection.subscribeChanges((nextChanges) => {
+      changes.push(nextChanges.map((change) => ({ type: change.type })));
+    });
+
+    collection.utils.writeBatch(() => {
+      collection.utils.writeUpdate({
+        id: "batched-1",
+        gold: 2,
+      });
+      collection.utils.writeBatch(() => {
+        collection.utils.writeUpsert({
+          id: "batched-2",
+          athlete: "New row",
+          country: "Canada",
+          gold: 3,
+        });
+      });
+    });
+
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toHaveLength(2);
+    expect(collection.get("batched-1")).toMatchObject({
+      id: "batched-1",
+      athlete: "Queued",
+      country: "USA",
+      gold: 2,
+    });
+    expect(collection.get("batched-2")).toMatchObject({
+      id: "batched-2",
+      athlete: "New row",
+      country: "Canada",
+      gold: 3,
+    });
+    expect(collection.utils.getMetrics().lastCommitChangeCount).toBe(2);
+    expect(collection.utils.getMetrics().totalCommitCount).toBeGreaterThan(0);
   });
 });

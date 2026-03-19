@@ -5,6 +5,10 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
   "dependencies": {
     "@sandbox/ag-grid-translator": "workspace:*",
     "@effect/platform": "^0.94.5",
