@@ -256,4 +256,68 @@ describe("store registry", () => {
       expect(result.rowCount).toBe(2);
     }),
   );
+
+  effect("stops emitting viewport patches after the session closes", () =>
+    Effect.gen(function* () {
+      const registry = new StoreRegistry();
+      registry.loadStore(
+        {
+          storeId: "close-session",
+          rowKey: "id",
+        },
+        {
+          kind: "rows",
+          rows: [
+            {
+              id: "1",
+              athlete: "Alpha",
+              country: "USA",
+              sport: "Swimming",
+              year: 2012,
+            },
+          ] as ReadonlyArray<RowRecord>,
+        },
+      );
+
+      const updateCount = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const patches = yield* Queue.unbounded<ReadonlyArray<RowRecord>>();
+          yield* Stream.runForEachScoped(
+            registry.openViewportSession({
+              sessionId: "close-session-id",
+              storeId: "close-session",
+              startRow: 0,
+              endRow: 5,
+              query: {
+                predicate: null,
+                sorts: [],
+              },
+            }),
+            (patch) => patches.offer(patch.rows),
+          ).pipe(Effect.forkScoped);
+
+          yield* patches.take;
+          yield* registry.closeViewportSession("close-session-id");
+
+          registry.applyTransaction("close-session", {
+            kind: "upsert",
+            rows: [
+              {
+                id: "2",
+                athlete: "Bravo",
+                country: "Canada",
+                sport: "Rowing",
+                year: 2016,
+              },
+            ],
+          });
+          yield* Effect.promise(() => Promise.resolve());
+
+          return yield* Queue.size(patches);
+        }),
+      );
+
+      expect(updateCount).toBe(0);
+    }),
+  );
 });

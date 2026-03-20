@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Data from "effect/Data";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
@@ -52,6 +53,30 @@ export interface ViewportDiagnostics {
 const INITIAL_VIEWPORT_ROW_COUNT = 50;
 const DEFAULT_QUERY_DEBOUNCE_MS = 200;
 type ViewportRefreshKind = "range" | "query";
+
+type ViewportDatasourceState =
+  | {
+      readonly _tag: "Idle";
+      readonly version: number;
+    }
+  | {
+      readonly _tag: "Starting";
+      readonly version: number;
+      readonly session: WorkerViewportSessionHandle;
+      readonly startPromise: Promise<void>;
+    }
+  | {
+      readonly _tag: "Live";
+      readonly version: number;
+      readonly session: WorkerViewportSessionHandle;
+      readonly scope: Scope.CloseableScope;
+    }
+  | {
+      readonly _tag: "Destroyed";
+      readonly version: number;
+    };
+
+const ViewportDatasourceState = Data.taggedEnum<ViewportDatasourceState>();
 
 function columnStateToSortModel(
   columnState: ReadonlyArray<ColumnState>,
@@ -152,11 +177,10 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
   options: GridStoreAdapterOptions,
 ): ViewportDatasourceHandle {
   let params: IViewportDatasourceParams<TData> | null = null;
-  let activeScope: Scope.CloseableScope | null = null;
-  let viewportSession: WorkerViewportSessionHandle | null = null;
-  let sessionStart: Promise<void> | null = null;
+  let state: ViewportDatasourceState = ViewportDatasourceState.Idle({
+    version: 0,
+  });
   let queryRefreshHandle: ReturnType<typeof setTimeout> | null = null;
-  let lifecycleVersion = 0;
   let patchCount = 0;
   let ignoredPatchCount = 0;
   let isLoading = true;
@@ -166,6 +190,7 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     startRow: 0,
     endRow: INITIAL_VIEWPORT_ROW_COUNT,
   };
+  const readState = (): ViewportDatasourceState => state;
 
   const emitDiagnostics = (
     fulfilledRange: ViewportDiagnostics["fulfilledRange"] = null,
@@ -173,7 +198,7 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     options.onViewportDiagnostics?.({
       requestedRange: { ...viewportRange },
       fulfilledRange,
-      requestVersion: lifecycleVersion,
+      requestVersion: state.version,
       isLoading,
       lastPatchLatencyMs,
       ignoredPatchCount,
@@ -186,30 +211,23 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     emitDiagnostics();
   };
 
-  const closeActiveResources = async () => {
+  const closeResources = async (currentState: ViewportDatasourceState) => {
     if (queryRefreshHandle !== null) {
       clearTimeout(queryRefreshHandle);
       queryRefreshHandle = null;
     }
 
-    if (activeScope === null) {
-      if (viewportSession !== null) {
-        const session = viewportSession;
-        viewportSession = null;
+    await ViewportDatasourceState.$match(currentState, {
+      Idle: async () => undefined,
+      Destroyed: async () => undefined,
+      Starting: async ({ session }) => {
         await session.close().catch(() => undefined);
-      }
-      return;
-    }
-
-    const scope = activeScope;
-    activeScope = null;
-    const session = viewportSession;
-    viewportSession = null;
-    sessionStart = null;
-    await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
-    if (session !== null) {
-      await session.close().catch(() => undefined);
-    }
+      },
+      Live: async ({ session, scope }) => {
+        await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
+        await session.close().catch(() => undefined);
+      },
+    });
   };
 
   const applyPatch = (
@@ -243,35 +261,49 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
   };
 
   const startViewportSession = (currentParams: IViewportDatasourceParams<TData>) => {
-    const start = async () => {
-      const version = ++lifecycleVersion;
-      const nextSession = collection.openViewportSession({
-        startRow: viewportRange.startRow,
-        endRow: viewportRange.endRow,
-        query: readQuery(currentParams),
-      });
-      viewportSession = nextSession;
+    const version = state.version + 1;
+    const nextSession = collection.openViewportSession({
+      startRow: viewportRange.startRow,
+      endRow: viewportRange.endRow,
+      query: readQuery(currentParams),
+    });
 
+    let startPromise = Promise.resolve();
+    state = ViewportDatasourceState.Starting({
+      version,
+      session: nextSession,
+      startPromise,
+    });
+    startPromise = (async () => {
       const scope = await Effect.runPromise(Scope.make());
-      if (params !== currentParams || version !== lifecycleVersion) {
+      const latestState = state;
+      if (
+        params !== currentParams ||
+        latestState._tag !== "Starting" ||
+        latestState.version !== version ||
+        latestState.session !== nextSession
+      ) {
         await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
         await nextSession.close().catch(() => undefined);
-        if (viewportSession === nextSession) {
-          viewportSession = null;
-        }
         return;
       }
 
-      activeScope = scope;
+      state = ViewportDatasourceState.Live({
+        version,
+        session: nextSession,
+        scope,
+      });
       await Effect.runPromise(
         Scope.extend(
           Stream.runForEachScoped(nextSession.updates, (patch) =>
             Effect.sync(() => {
+              const currentState = state;
               if (
                 params === null ||
                 params !== currentParams ||
-                version !== lifecycleVersion ||
-                viewportSession !== nextSession
+                currentState._tag !== "Live" ||
+                currentState.version !== version ||
+                currentState.session !== nextSession
               ) {
                 ignoredPatchCount += 1;
                 emitDiagnostics();
@@ -284,31 +316,41 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
           scope,
         ),
       );
-    };
-
-    const startPromise = start();
-    sessionStart = startPromise.finally(() => {
-      if (sessionStart === startPromise) {
-        sessionStart = null;
+    })().finally(() => {
+      const latestState = state;
+      if (
+        latestState._tag === "Starting" &&
+        latestState.version === version &&
+        latestState.session === nextSession
+      ) {
+        state = ViewportDatasourceState.Idle({
+          version,
+        });
       }
+    });
+    state = ViewportDatasourceState.Starting({
+      version,
+      session: nextSession,
+      startPromise,
     });
     return startPromise;
   };
 
   const syncViewportQuery = async (kind: ViewportRefreshKind) => {
-    if (params === null) {
+    if (params === null || state._tag === "Destroyed") {
       return;
     }
 
-    if (viewportSession === null) {
+    if (state._tag === "Idle") {
       beginLoading();
       await startViewportSession(params);
       return;
     }
 
-    if (sessionStart !== null) {
-      await sessionStart;
-      if (params === null || viewportSession === null) {
+    if (state._tag === "Starting") {
+      await state.startPromise;
+      const latestState = readState();
+      if (params === null || latestState._tag !== "Live") {
         return;
       }
     }
@@ -316,7 +358,11 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
     if (kind === "query") {
       beginLoading();
     }
-    await viewportSession.replace({
+    if (state._tag !== "Live") {
+      return;
+    }
+
+    await state.session.replace({
       startRow: viewportRange.startRow,
       endRow: viewportRange.endRow,
       query: readQuery(params),
@@ -369,9 +415,12 @@ export function createViewportDatasource<TData extends RowRecord = RowRecord>(
       void syncViewportQuery("query").catch(() => undefined);
     },
     destroy() {
-      lifecycleVersion += 1;
+      const currentState = state;
       params = null;
-      void closeActiveResources();
+      state = ViewportDatasourceState.Destroyed({
+        version: currentState.version + 1,
+      });
+      void closeResources(currentState);
     },
   };
 }

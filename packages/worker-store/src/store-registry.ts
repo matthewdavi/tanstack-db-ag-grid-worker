@@ -1,4 +1,5 @@
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -8,7 +9,6 @@ import * as Queue from "effect/Queue";
 import * as Runtime from "effect/Runtime";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
-import * as ScopedRef from "effect/ScopedRef";
 import { Stream } from "effect";
 
 import type { GridQueryState } from "@sandbox/ag-grid-translator";
@@ -34,6 +34,18 @@ import {
   executeGridQuery,
   type RowRecord,
 } from "./query-runtime";
+import {
+  makeBootingViewportState,
+  makeBuildBindingCommand,
+  toViewportQueryKey,
+  transitionViewportSession,
+  type ViewportBindingHandle,
+  type ViewportRequest,
+  type ViewportSessionCommand,
+  type ViewportSessionEvent,
+  type ViewportSessionState,
+} from "./viewport-session-machine";
+
 const DEFAULT_STRESS_TICK_MS = 100;
 
 interface StoreEntry {
@@ -44,30 +56,39 @@ interface StoreEntry {
   stressFiber: Fiber.RuntimeFiber<void, unknown> | null;
 }
 
-interface ViewportSessionState {
+type ViewportReplaceReply = Deferred.Deferred<ReplaceViewportSessionSuccess, string>;
+type ViewportCloseReply = Deferred.Deferred<CloseViewportSessionSuccess, never>;
+
+interface ViewportSessionBinding extends ViewportBindingHandle {
+  publish(
+    request: ViewportRequest,
+    triggeredAtMs: number | null,
+  ): Effect.Effect<void>;
+  close(): Effect.Effect<void>;
+}
+
+type ViewportMachineState = ViewportSessionState<
+  ViewportReplaceReply,
+  ViewportSessionBinding
+>;
+type ViewportMachineEvent = ViewportSessionEvent<
+  ViewportReplaceReply,
+  ViewportCloseReply,
+  ViewportSessionBinding
+>;
+type ViewportMachineCommand = ViewportSessionCommand<
+  ViewportReplaceReply,
+  ViewportCloseReply,
+  ViewportSessionBinding
+>;
+
+interface ViewportSessionEntry {
   readonly sessionId: string;
   readonly storeId: string;
   readonly queue: Queue.Queue<ViewportPatch>;
-  request: ViewportRequest;
-  revision: number;
-  closed: boolean;
-}
-
-interface ViewportRequest {
-  startRow: number;
-  endRow: number;
-  query: GridQueryState;
-}
-
-interface ViewportSessionBinding {
-  readonly queryKey: string;
-  publish(triggeredAtMs: number | null): Effect.Effect<void>;
-}
-
-interface ViewportSessionEntry {
-  readonly state: ViewportSessionState;
-  readonly scope: Scope.CloseableScope;
-  readonly bindingRef: ScopedRef.ScopedRef<ViewportSessionBinding>;
+  readonly events: Queue.Queue<ViewportMachineEvent>;
+  readonly bootReady: Deferred.Deferred<void, string>;
+  readonly actorFiber: Fiber.RuntimeFiber<void, never>;
 }
 
 export class StoreRegistry {
@@ -201,8 +222,8 @@ export class StoreRegistry {
     return Stream.unwrapScoped(
       Effect.acquireRelease(
         this.makeViewportSession(request),
-        (session) => this.closeViewportSession(session.state.sessionId),
-      ).pipe(Effect.map((session) => Stream.fromQueue(session.state.queue))),
+        (session) => this.closeViewportSession(session.sessionId),
+      ).pipe(Effect.map((session) => Stream.fromQueue(session.queue))),
     );
   }
 
@@ -216,27 +237,15 @@ export class StoreRegistry {
         catch: (error) =>
           error instanceof Error ? error.message : "Unknown viewport session",
       });
-      session.state.request = {
-        startRow: request.startRow,
-        endRow: request.endRow,
-        query: request.query,
-      };
-
-      const binding = yield* ScopedRef.get(session.bindingRef);
-      if (binding.queryKey === self.toQueryKey(request.query)) {
-        yield* binding.publish(null);
-      } else {
-        session.state.revision += 1;
-        yield* ScopedRef.set(
-          session.bindingRef,
-          self.makeViewportBinding(session.state, request.query),
-        );
-      }
-
-      return {
-        sessionId: request.sessionId,
-        replaced: true,
-      };
+      const reply = yield* Deferred.make<ReplaceViewportSessionSuccess, string>();
+      yield* Queue.offer(session.events, {
+        _tag: "Replace",
+        request: self.toViewportRequest(request),
+        reply,
+      }).pipe(
+        Effect.catchAll(() => Effect.fail("Viewport session closed")),
+      );
+      return yield* Deferred.await(reply);
     });
   }
 
@@ -253,10 +262,14 @@ export class StoreRegistry {
         };
       }
 
-      session.state.closed = true;
+      const reply = yield* Deferred.make<CloseViewportSessionSuccess>();
+      yield* Queue.offer(session.events, {
+        _tag: "Close",
+        reply,
+      }).pipe(Effect.catchAll(() => Effect.void));
+      yield* Deferred.await(reply);
+      yield* Fiber.await(session.actorFiber).pipe(Effect.ignore);
       self.viewportSessions.delete(sessionId);
-      yield* Scope.close(session.scope, Exit.void);
-      yield* Queue.shutdown(session.state.queue);
 
       return {
         sessionId,
@@ -272,7 +285,7 @@ export class StoreRegistry {
     }
     this.stores.delete(storeId);
     for (const [sessionId, session] of this.viewportSessions.entries()) {
-      if (session.state.storeId === storeId) {
+      if (session.storeId === storeId) {
         void Effect.runPromise(this.closeViewportSession(sessionId));
       }
     }
@@ -325,45 +338,187 @@ export class StoreRegistry {
       });
 
       const queue = yield* Queue.unbounded<ViewportPatch>();
-      const scope = yield* Scope.make();
-      const state: ViewportSessionState = {
+      const events = yield* Queue.unbounded<ViewportMachineEvent>();
+      const bootReady = yield* Deferred.make<void, string>();
+      const sessionBase = {
         sessionId: request.sessionId,
         storeId: request.storeId,
         queue,
-        request: {
-          startRow: request.startRow,
-          endRow: request.endRow,
-          query: request.query,
-        },
-        revision: 1,
-        closed: false,
+        events,
+        bootReady,
       };
-      const bindingRef = yield* Scope.extend(
-        ScopedRef.fromAcquire(
-          self.makeViewportBinding(state, request.query),
+      const actorFiber = yield* self.runViewportSessionActor(
+        sessionBase,
+        self.toViewportRequest(request),
+      ).pipe(
+        Effect.catchAll((error) =>
+          Deferred.fail(bootReady, error).pipe(
+            Effect.zipRight(Queue.shutdown(queue)),
+            Effect.zipRight(Queue.shutdown(events)),
+            Effect.asVoid,
+          ),
         ),
-        scope,
+        Effect.forkScoped,
       );
 
       const session: ViewportSessionEntry = {
-        state,
-        scope,
-        bindingRef,
+        ...sessionBase,
+        actorFiber,
       };
       self.viewportSessions.set(request.sessionId, session);
+      yield* Deferred.await(bootReady).pipe(
+        Effect.tapError(() => {
+          self.viewportSessions.delete(request.sessionId);
+          return Fiber.await(actorFiber).pipe(Effect.ignore);
+        }),
+      );
       return session;
     });
   }
 
+  private runViewportSessionActor(
+    session: Pick<ViewportSessionEntry, "sessionId" | "storeId" | "queue" | "events" | "bootReady">,
+    request: ViewportRequest,
+  ): Effect.Effect<void, string> {
+    const initialState = makeBootingViewportState<ViewportReplaceReply>(
+      request,
+    ) as ViewportMachineState;
+
+    const process = (
+      state: ViewportMachineState,
+    ): Effect.Effect<void, string> => {
+      if (state._tag === "Closed") {
+        return Queue.shutdown(session.queue).pipe(
+          Effect.zipRight(Queue.shutdown(session.events)),
+          Effect.asVoid,
+        );
+      }
+
+      return Queue.take(session.events).pipe(
+        Effect.flatMap((event) => {
+          const result = transitionViewportSession(state, event);
+          return this.interpretViewportCommands(session, result.commands).pipe(
+            Effect.zipRight(
+              this.resolveViewportBootTransition(
+                session.bootReady,
+                state,
+                result.state as ViewportMachineState,
+                event,
+              ),
+            ),
+            Effect.zipRight(process(result.state as ViewportMachineState)),
+          );
+        }),
+      );
+    };
+
+    return this.interpretViewportCommands(session, [
+      makeBuildBindingCommand<
+        ViewportReplaceReply,
+        ViewportCloseReply,
+        ViewportSessionBinding
+      >(request),
+    ]).pipe(
+      Effect.zipRight(process(initialState)),
+    );
+  }
+
+  private resolveViewportBootTransition(
+    bootReady: Deferred.Deferred<void, string>,
+    previous: ViewportMachineState,
+    next: ViewportMachineState,
+    event: ViewportMachineEvent,
+  ) {
+    if (previous._tag !== "Booting" || next._tag === "Booting") {
+      return Effect.void;
+    }
+
+    if (next._tag === "Live") {
+      return Deferred.succeed(bootReady, undefined).pipe(Effect.ignore);
+    }
+
+    if (event._tag === "BindingFailed" && event.queryKey === previous.queryKey) {
+      return Deferred.fail(bootReady, event.error).pipe(Effect.ignore);
+    }
+
+    return Deferred.fail(bootReady, "Viewport session closed").pipe(Effect.ignore);
+  }
+
+  private interpretViewportCommands(
+    session: Pick<ViewportSessionEntry, "sessionId" | "storeId" | "queue" | "events">,
+    commands: ReadonlyArray<ViewportMachineCommand>,
+  ): Effect.Effect<void, string> {
+    return Effect.forEach(commands, (command) =>
+      Match.value(command).pipe(
+        Match.when({ _tag: "BuildBinding" }, ({ request }) =>
+          Effect.fork(
+            this.makeViewportBinding(session, request.query).pipe(
+              Effect.flatMap((binding) =>
+                Queue.offer(session.events, {
+                  _tag: "BindingReady",
+                  request,
+                  queryKey: binding.queryKey,
+                  binding,
+                }),
+              ),
+              Effect.catchAll((error) =>
+                Queue.offer(session.events, {
+                  _tag: "BindingFailed",
+                  queryKey: toViewportQueryKey(request.query),
+                  error,
+                }).pipe(Effect.catchAll(() => Effect.void)),
+              ),
+              Effect.asVoid,
+            ),
+          ).pipe(Effect.asVoid),
+        ),
+        Match.when({ _tag: "Publish" }, ({ binding, request, triggeredAtMs }) =>
+          binding.publish(request, triggeredAtMs),
+        ),
+        Match.when({ _tag: "CloseBinding" }, ({ binding }) =>
+          binding.close().pipe(Effect.catchAll(() => Effect.void)),
+        ),
+        Match.when({ _tag: "ResolveReplace" }, ({ reply }) =>
+          Deferred.succeed(reply, {
+            sessionId: session.sessionId,
+            replaced: true,
+          }).pipe(Effect.asVoid),
+        ),
+        Match.when({ _tag: "ResolveReplaceMany" }, ({ replies }) =>
+          Effect.forEach(replies, (reply) =>
+            Deferred.succeed(reply, {
+              sessionId: session.sessionId,
+              replaced: true,
+            }).pipe(Effect.asVoid),
+          ).pipe(Effect.asVoid),
+        ),
+        Match.when({ _tag: "RejectReplace" }, ({ reply, error }) =>
+          Deferred.fail(reply, error).pipe(Effect.asVoid),
+        ),
+        Match.when({ _tag: "RejectReplaceMany" }, ({ replies, error }) =>
+          Effect.forEach(replies, (reply) =>
+            Deferred.fail(reply, error).pipe(Effect.asVoid),
+          ).pipe(Effect.asVoid),
+        ),
+        Match.when({ _tag: "ResolveClose" }, ({ reply }) =>
+          Deferred.succeed(reply, {
+            sessionId: session.sessionId,
+            closed: true,
+          }).pipe(Effect.asVoid),
+        ),
+        Match.exhaustive,
+      ), { concurrency: 1 },
+    ).pipe(Effect.asVoid);
+  }
+
   private makeViewportBinding(
-    session: ViewportSessionState,
+    session: Pick<ViewportSessionEntry, "storeId" | "queue" | "events">,
     query: GridQueryState,
-  ): Effect.Effect<ViewportSessionBinding, string, Scope.Scope> {
-    const revision = session.revision;
+  ): Effect.Effect<ViewportSessionBinding, string> {
     const store = this.requireStore(session.storeId);
     const rowCountCollection = createRowCountCollection(store.collection, query);
     const queryCollection = createQueryCollection(store.collection, query);
-    const queryKey = this.toQueryKey(query);
+    const queryKey = toViewportQueryKey(query);
 
     return Effect.gen(this, function* () {
       const runtime = (yield* Effect.withFiberRuntime((fiber, status) =>
@@ -375,96 +530,99 @@ export class StoreRegistry {
           }),
         ),
       )) as Runtime.Runtime<any>;
-      return yield* Effect.acquireRelease(
-        Effect.tryPromise({
-          try: async () => {
-            await Promise.all([
-              rowCountCollection.preload(),
-              queryCollection.preload(),
-            ]);
+      const scope = yield* Scope.make();
+      yield* Scope.extend(
+        Effect.acquireRelease(
+          Effect.tryPromise({
+            try: async () => {
+              await Promise.all([
+                rowCountCollection.preload(),
+                queryCollection.preload(),
+              ]);
 
-            let publishScheduled = false;
-            let scheduledPatchAtMs: number | null = null;
-            const publish = (triggeredAtMs: number | null) =>
-              this.publishViewportPatch(
-                runtime,
-                session,
-                revision,
-                rowCountCollection,
-                queryCollection,
-                triggeredAtMs,
-              );
-            const schedulePublish = () => {
-              if (publishScheduled) {
-                return;
-              }
+              let publishScheduled = false;
+              let scheduledPatchAtMs: number | null = null;
+              const schedulePublish = () => {
+                if (publishScheduled) {
+                  return;
+                }
 
-              publishScheduled = true;
-              scheduledPatchAtMs = Runtime.runSync(runtime, Clock.currentTimeMillis);
-              queueMicrotask(() => {
-                publishScheduled = false;
-                const triggeredAtMs = scheduledPatchAtMs;
-                scheduledPatchAtMs = null;
-                void Runtime.runPromise(
-                  runtime,
-                  publish(triggeredAtMs),
-                );
-              });
-            };
+                publishScheduled = true;
+                scheduledPatchAtMs = Runtime.runSync(runtime, Clock.currentTimeMillis);
+                queueMicrotask(() => {
+                  publishScheduled = false;
+                  const triggeredAtMs = scheduledPatchAtMs;
+                  scheduledPatchAtMs = null;
+                  void Runtime.runPromise(
+                    runtime,
+                    Queue.offer(session.events, {
+                      _tag: "SourceChanged",
+                      queryKey,
+                      triggeredAtMs,
+                    }).pipe(Effect.catchAll(() => Effect.void)),
+                  );
+                });
+              };
 
-            await Runtime.runPromise(
-              runtime,
-              publish(null),
-            );
-            const rowCountSubscription = rowCountCollection.subscribeChanges(schedulePublish);
-            const querySubscription = queryCollection.subscribeChanges(schedulePublish);
+              const rowCountSubscription = rowCountCollection.subscribeChanges(schedulePublish);
+              const querySubscription = queryCollection.subscribeChanges(schedulePublish);
 
-            return {
-              queryKey,
-              rowCountSubscription,
-              querySubscription,
-              publish,
-            };
-          },
-          catch: (error) =>
-            error instanceof Error ? error.message : "Failed to preload viewport session",
-        }),
-        ({ rowCountSubscription, querySubscription }) =>
-          Effect.sync(() => {
-            rowCountSubscription.unsubscribe();
-            querySubscription.unsubscribe();
+              return {
+                rowCountSubscription,
+                querySubscription,
+              };
+            },
+            catch: (error) =>
+              error instanceof Error ? error.message : "Failed to preload viewport session",
           }),
-      ).pipe(
-        Effect.map(({ queryKey, publish }) => ({
-          queryKey,
-          publish,
-        })),
+          ({ rowCountSubscription, querySubscription }) =>
+            Effect.sync(() => {
+              rowCountSubscription.unsubscribe();
+              querySubscription.unsubscribe();
+            }),
+        ),
+        scope,
       );
+
+      return {
+        queryKey,
+        publish: (request, triggeredAtMs) =>
+          this.publishViewportPatch(
+            runtime,
+            session.storeId,
+            session.queue,
+            rowCountCollection,
+            queryCollection,
+            request,
+            triggeredAtMs,
+          ),
+        close: () => Scope.close(scope, Exit.void),
+      };
     });
   }
 
   private publishViewportPatch(
     runtime: Runtime.Runtime<any>,
-    session: ViewportSessionState,
-    revision: number,
+    storeId: string,
+    queue: Queue.Queue<ViewportPatch>,
     rowCountCollection: ReturnType<typeof createQueryCollection>,
     queryCollection: ReturnType<typeof createQueryCollection>,
+    request: ViewportRequest,
     triggeredAtMs: number | null,
   ) {
-    if (session.closed || revision !== session.revision || !session.queue.isActive()) {
+    if (!queue.isActive()) {
       return Effect.void;
     }
 
-    const request = session.request;
     return Effect.sync(() => Runtime.runSync(runtime, Clock.currentTimeMillis)).pipe(
       Effect.flatMap((emittedAtMs) =>
-        Queue.offer(session.queue, {
-          storeId: session.storeId,
+        Queue.offer(queue, {
+          storeId,
           startRow: request.startRow,
           endRow: request.endRow,
           rowCount: rowCountCollection.size,
           latencyMs: triggeredAtMs === null ? 0 : Math.max(0, emittedAtMs - triggeredAtMs),
-          metrics: this.requireStore(session.storeId).collection.utils.getMetrics(),
+          metrics: this.requireStore(storeId).collection.utils.getMetrics(),
           rows: collectWindowRows(queryCollection, request) as unknown as ReadonlyArray<RowRecord>,
         }).pipe(
           Effect.catchAll(() => Effect.void),
@@ -472,8 +630,14 @@ export class StoreRegistry {
     );
   }
 
-  private toQueryKey(query: GridQueryState) {
-    return JSON.stringify(query);
+  private toViewportRequest(
+    request: Pick<OpenViewportSessionRequest, "startRow" | "endRow" | "query">,
+  ): ViewportRequest {
+    return {
+      startRow: request.startRow,
+      endRow: request.endRow,
+      query: request.query,
+    };
   }
 
   private requireStore(storeId: string): StoreEntry {
