@@ -20,7 +20,7 @@ import { translateAgGridQuery } from "@sandbox/ag-grid-translator";
 import type { SqliteRow } from "./store-config";
 import type { StoreMetrics } from "./worker-contract";
 import type {
-  SqliteCollectionHandle,
+  ReadOnlySqliteWorkerClient,
   SqliteViewportSessionHandle,
 } from "./worker-client";
 
@@ -129,7 +129,7 @@ export interface ViewportDatasourceHandle extends IViewportDatasource {
 }
 
 export function createSqliteViewportDatasource<TData extends SqliteRow = SqliteRow>(
-  collection: Pick<SqliteCollectionHandle<TData>, "openViewportSession">,
+  collection: Pick<ReadOnlySqliteWorkerClient<TData>, "openViewportSession">,
   options: GridStoreAdapterOptions,
 ): ViewportDatasourceHandle {
   let params: IViewportDatasourceParams<TData> | null = null;

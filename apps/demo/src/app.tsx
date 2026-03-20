@@ -27,14 +27,14 @@ import {
   type WorkerClient,
   type WorkerCollectionHandle,
 } from "@sandbox/worker-store";
-import { translateAgGridQuery } from "@sandbox/ag-grid-translator";
+import type { AgGridSqliteClient } from "@sandbox/sqlite-store";
 import {
-  createSqliteViewportDatasource,
-  createSqliteWorkerClient,
-  type SqliteCollectionHandle,
-  type SqliteWorkerClient,
-} from "@sandbox/sqlite-store";
-import type { MarketRow } from "./market-sqlite-store";
+  INITIAL_DEMO_ROW_COUNT,
+  ROW_KEY,
+  SQLITE_STORE_ID,
+  STORE_ID,
+} from "./demo-constants";
+import { marketGrid, type MarketRow } from "./market-sqlite-store";
 
 const licenseKey = import.meta.env.VITE_AG_GRID_LICENSE_KEY;
 if (typeof licenseKey === "string" && licenseKey.length > 0) {
@@ -43,10 +43,6 @@ if (typeof licenseKey === "string" && licenseKey.length > 0) {
 
 AgGridModuleRegistry.registerModules([AllEnterpriseModule]);
 
-const STORE_ID = "olympic-athletes";
-const SQLITE_STORE_ID = "sqlite-olympic-athletes";
-const ROW_KEY = "id";
-const INITIAL_DEMO_ROW_COUNT = 100_000;
 function createViewportLoadingOverlay(title: string, body: string) {
   return `
     <div class="viewport-loading-overlay" role="status" aria-live="polite">
@@ -81,38 +77,22 @@ interface ViewportStateDiagnostics {
   patchCount: number;
 }
 
-interface ViewportLikeSessionHandle {
-  replace(request: {
-    startRow: number;
-    endRow: number;
-    query: ReturnType<typeof translateQuery>;
-  }): Promise<unknown>;
-  close(): Promise<unknown>;
+interface ViewportDatasourceClient {
+  readonly storeId: string;
+  viewportDatasource(options?: {
+    onSnapshot?: (snapshot: {
+      startRow: number;
+      endRow: number;
+      rowCount: number;
+      metrics: WorkerMetrics;
+    }) => void;
+    onViewportDiagnostics?: (diagnostics: ViewportStateDiagnostics) => void;
+  }): ViewportDatasourceLike;
 }
 
-interface ViewportLikeCollectionHandle {
-  storeId: string;
-  applyTransaction(transaction: {
-    kind: "upsert";
-    rows: ReadonlyArray<MarketRow>;
-  }): Promise<unknown>;
-  openViewportSession(request: {
-    startRow: number;
-    endRow: number;
-    query: ReturnType<typeof translateQuery>;
-    sessionId?: string;
-  }): ViewportLikeSessionHandle & {
-    updates: any;
-    sessionId: string;
-  };
-  setStressRate(rowsPerSecond: number): Promise<unknown>;
-}
-
-function translateQuery(filterModel: unknown, sortModel: unknown) {
-  return translateAgGridQuery({
-    filterModel,
-    sortModel,
-  });
+interface DemoSqliteClient extends AgGridSqliteClient<MarketRow> {
+  pushLiveUpdate(): void;
+  setStressRate(rowsPerSecond: number): void;
 }
 
 type ViewportDatasourceLike = IViewportDatasource & {
@@ -122,7 +102,6 @@ type ViewportDatasourceLike = IViewportDatasource & {
 };
 
 type ViewportDatasourceFactory = (
-  collection: Pick<ViewportLikeCollectionHandle, "openViewportSession">,
   options: {
     storeId: string;
     onSnapshot?: (snapshot: {
@@ -254,12 +233,39 @@ function makeBrowserWorkerClient() {
 }
 
 function makeBrowserSqliteWorkerClient() {
-  return createSqliteWorkerClient<MarketRow>(
-    () =>
-      new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
-        type: "module",
-      }),
+  const worker = new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
+    type: "module",
+  });
+  const controls = new MessageChannel();
+  worker.postMessage(
+    {
+      type: "sqlite-demo-init-port",
+    },
+    [controls.port1],
   );
+
+  return marketGrid.connect(
+    () => worker,
+    {
+      storeId: SQLITE_STORE_ID,
+    },
+  ).then((client) => ({
+    ...client,
+    pushLiveUpdate() {
+      controls.port2.postMessage({ type: "sqlite-demo-push-update" });
+    },
+    setStressRate(rowsPerSecond: number) {
+      controls.port2.postMessage({
+        type: "sqlite-demo-set-stress-rate",
+        rowsPerSecond,
+      });
+    },
+    async close() {
+      controls.port2.close();
+      await client.close();
+      worker.terminate();
+    },
+  }) satisfies DemoSqliteClient);
 }
 
 function useWorkerClient<TClient extends { close(): Promise<void> }>(
@@ -311,7 +317,7 @@ function useWorkerClient<TClient extends { close(): Promise<void> }>(
 }
 
 function useStoreBootstrap(
-  client: Pick<WorkerClient, "loadStore"> | Pick<SqliteWorkerClient, "loadStore"> | null,
+  client: Pick<WorkerClient, "loadStore"> | null,
   storeId: string,
 ) {
   const [ready, setReady] = useState(false);
@@ -486,10 +492,13 @@ interface ViewportGridPanelProps {
   body: string;
   status: string;
   rowLabel: string;
-  loadingOverlayTitle: string;
-  loadingOverlayBody: string;
-  collection: ViewportLikeCollectionHandle;
-  createDatasource: ViewportDatasourceFactory;
+  loadingOverlayTitle?: string;
+  loadingOverlayBody?: string;
+  useGridLoadingOverlay?: boolean;
+  datasourceClient: ViewportDatasourceClient;
+  createDatasource?: ViewportDatasourceFactory;
+  onPushLiveUpdate?: () => void;
+  onSetStressRate?: (rowsPerSecond: number) => void;
 }
 
 function ViewportGridPanel(props: ViewportGridPanelProps) {
@@ -516,58 +525,97 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
   });
 
   useEffect(() => {
+    if (!props.useGridLoadingOverlay) {
+      apiRef.current?.setGridOption("loading", false);
+      return;
+    }
+
     apiRef.current?.setGridOption("loading", diagnostics.isLoading);
-  }, [diagnostics.isLoading]);
+  }, [diagnostics.isLoading, props.useGridLoadingOverlay]);
 
   useEffect(() => {
     if (apiRef.current === null) {
       return;
     }
 
-    const datasource = props.createDatasource(props.collection, {
-      storeId: props.collection.storeId,
-      onSnapshot: (snapshot) => {
-        startTransition(() => {
-          setRowCount(snapshot.rowCount);
-          setMetrics(snapshot.metrics);
+    const datasource = props.createDatasource
+      ? props.createDatasource({
+          storeId: props.datasourceClient.storeId,
+          onSnapshot: (snapshot) => {
+            startTransition(() => {
+              setRowCount(snapshot.rowCount);
+              setMetrics(snapshot.metrics);
+            });
+          },
+          onViewportDiagnostics: (nextDiagnostics) => {
+            startTransition(() => {
+              setDiagnostics(nextDiagnostics);
+            });
+          },
+        })
+      : props.datasourceClient.viewportDatasource({
+          onSnapshot: (snapshot) => {
+            startTransition(() => {
+              setRowCount(snapshot.rowCount);
+              setMetrics(snapshot.metrics);
+            });
+          },
+          onViewportDiagnostics: (nextDiagnostics) => {
+            startTransition(() => {
+              setDiagnostics(nextDiagnostics);
+            });
+          },
         });
-      },
-      onViewportDiagnostics: (nextDiagnostics) => {
-        startTransition(() => {
-          setDiagnostics(nextDiagnostics);
-        });
-      },
-    });
     datasourceRef.current = datasource;
     apiRef.current.setGridOption(
       "viewportDatasource",
       datasource,
     );
-    apiRef.current.setGridOption("loading", diagnostics.isLoading);
-  }, [props.collection]);
+    apiRef.current.setGridOption(
+      "loading",
+      props.useGridLoadingOverlay ? diagnostics.isLoading : false,
+    );
+  }, [props.createDatasource, props.datasourceClient, props.useGridLoadingOverlay]);
 
   const handleReady = (event: GridReadyEvent<MarketRow>) => {
     apiRef.current = event.api;
-    const datasource = props.createDatasource(props.collection, {
-      storeId: props.collection.storeId,
-      onSnapshot: (snapshot) => {
-        startTransition(() => {
-          setRowCount(snapshot.rowCount);
-          setMetrics(snapshot.metrics);
+    const datasource = props.createDatasource
+      ? props.createDatasource({
+          storeId: props.datasourceClient.storeId,
+          onSnapshot: (snapshot) => {
+            startTransition(() => {
+              setRowCount(snapshot.rowCount);
+              setMetrics(snapshot.metrics);
+            });
+          },
+          onViewportDiagnostics: (nextDiagnostics) => {
+            startTransition(() => {
+              setDiagnostics(nextDiagnostics);
+            });
+          },
+        })
+      : props.datasourceClient.viewportDatasource({
+          onSnapshot: (snapshot) => {
+            startTransition(() => {
+              setRowCount(snapshot.rowCount);
+              setMetrics(snapshot.metrics);
+            });
+          },
+          onViewportDiagnostics: (nextDiagnostics) => {
+            startTransition(() => {
+              setDiagnostics(nextDiagnostics);
+            });
+          },
         });
-      },
-      onViewportDiagnostics: (nextDiagnostics) => {
-        startTransition(() => {
-          setDiagnostics(nextDiagnostics);
-        });
-      },
-    });
     datasourceRef.current = datasource;
     event.api.setGridOption(
       "viewportDatasource",
       datasource,
     );
-    event.api.setGridOption("loading", diagnostics.isLoading);
+    event.api.setGridOption(
+      "loading",
+      props.useGridLoadingOverlay ? diagnostics.isLoading : false,
+    );
   };
 
   const refreshViewport = (options?: {
@@ -584,34 +632,14 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
 
   const injectUpdate = () => {
     const timestamp = Date.now();
-    void props.collection
-      .applyTransaction({
-        kind: "upsert",
-        rows: [
-          {
-            id: `live-${timestamp}`,
-            symbol: `L${String(timestamp).slice(-3)}`,
-            company: `Live Market ${String(timestamp).slice(-4)}`,
-            sector: "Technology",
-            venue: "NASDAQ",
-            price: 100 + ((timestamp / 1000) % 250),
-            volume: 50_000,
-            active: true,
-            createdAt: new Date(timestamp).toISOString(),
-            updatedAt: new Date(timestamp).toISOString(),
-          },
-        ],
-      })
-      .then(() => undefined);
+    props.onPushLiveUpdate?.();
   };
 
   const updateStressRate = (nextRowsPerSecond: number) => {
     startTransition(() => {
       setRowsPerSecond(nextRowsPerSecond);
     });
-    void props.collection
-      .setStressRate(nextRowsPerSecond)
-      .then(() => undefined);
+    props.onSetStressRate?.(nextRowsPerSecond);
   };
   const handleStressInput = (value: string) => {
     updateStressRate(Number(value));
@@ -624,28 +652,32 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
       status={props.status}
     >
       <div className="panel-actions">
-        <button
-          className="action-button"
-          onClick={injectUpdate}
-          type="button"
-        >
-          Push live update
-        </button>
-        <label className="stress-control">
-          <span>Rows per second</span>
-          <input
-            aria-label="Rows per second"
-            max={2500}
-            min={0}
-            onInput={(event) => {
-              handleStressInput(event.currentTarget.value);
-            }}
-            step={10}
-            type="range"
-            value={rowsPerSecond}
-          />
-          <strong>{rowsPerSecond}</strong>
-        </label>
+        {props.onPushLiveUpdate ? (
+          <button
+            className="action-button"
+            onClick={injectUpdate}
+            type="button"
+          >
+            Push live update
+          </button>
+        ) : null}
+        {props.onSetStressRate ? (
+          <label className="stress-control">
+            <span>Rows per second</span>
+            <input
+              aria-label="Rows per second"
+              max={2500}
+              min={0}
+              onInput={(event) => {
+                handleStressInput(event.currentTarget.value);
+              }}
+              step={10}
+              type="range"
+              value={rowsPerSecond}
+            />
+            <strong>{rowsPerSecond}</strong>
+          </label>
+        ) : null}
         <button
           className="action-button action-button--ghost"
           onClick={() => {
@@ -655,15 +687,17 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
         >
           Refresh query snapshot
         </button>
-        <button
-          className="action-button action-button--ghost"
-          onClick={() => {
-            updateStressRate(0);
-          }}
-          type="button"
-        >
-          Stop stress stream
-        </button>
+        {props.onSetStressRate ? (
+          <button
+            className="action-button action-button--ghost"
+            onClick={() => {
+              updateStressRate(0);
+            }}
+            type="button"
+          >
+            Stop stress stream
+          </button>
+        ) : null}
       </div>
       <div className="viewport-diagnostics">
         <span>
@@ -689,10 +723,12 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
           columnDefs={COLUMN_DEFS as ColDef<MarketRow>[]}
           defaultColDef={DEFAULT_COL_DEF}
           getRowId={getStableRowId}
-          overlayLoadingTemplate={createViewportLoadingOverlay(
-            props.loadingOverlayTitle,
-            props.loadingOverlayBody,
-          )}
+          overlayLoadingTemplate={props.useGridLoadingOverlay && props.loadingOverlayTitle && props.loadingOverlayBody
+            ? createViewportLoadingOverlay(
+                props.loadingOverlayTitle,
+                props.loadingOverlayBody,
+              )
+            : undefined}
           rowModelType="viewport"
           statusBar={createRowCountStatusBar(props.rowLabel, rowCount, metrics)}
           viewportRowModelPageSize={50}
@@ -711,7 +747,7 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
 
 export interface AppProps {
   client?: WorkerClient;
-  sqliteClient?: SqliteWorkerClient<MarketRow>;
+  sqliteClient?: DemoSqliteClient;
 }
 
 export function App(props: AppProps) {
@@ -721,16 +757,9 @@ export function App(props: AppProps) {
     makeBrowserSqliteWorkerClient,
   );
   const { ready, error: bootstrapError } = useStoreBootstrap(client, STORE_ID);
-  const { ready: sqliteReady, error: sqliteBootstrapError } = useStoreBootstrap(
-    sqliteClient,
-    SQLITE_STORE_ID,
-  );
   const collection = client ? client.collection(STORE_ID) : null;
-  const sqliteCollection = sqliteClient
-    ? sqliteClient.collection(SQLITE_STORE_ID)
-    : null;
   const tanstackReady = ready && collection !== null;
-  const sqliteStoreReady = sqliteReady && sqliteCollection !== null;
+  const sqliteStoreReady = sqliteClient !== null;
 
   return (
     <main className="app-shell">
@@ -762,7 +791,6 @@ export function App(props: AppProps) {
       {clientError ? <p className="error-banner">{clientError}</p> : null}
       {sqliteClientError ? <p className="error-banner">{sqliteClientError}</p> : null}
       {bootstrapError ? <p className="error-banner">{bootstrapError}</p> : null}
-      {sqliteBootstrapError ? <p className="error-banner">{sqliteBootstrapError}</p> : null}
       <section className="grid-stack">
         {tanstackReady ? (
           <ServerSideGridPanel
@@ -784,8 +812,42 @@ export function App(props: AppProps) {
             rowLabel="TanStack rows"
             loadingOverlayTitle="Refreshing live query"
             loadingOverlayBody="Recomputing filters and sort in the worker."
-            collection={collection}
-            createDatasource={createViewportDatasource as ViewportDatasourceFactory}
+            useGridLoadingOverlay={true}
+            datasourceClient={{
+              storeId: collection.storeId,
+              viewportDatasource(options) {
+                return createViewportDatasource(collection, {
+                  storeId: collection.storeId,
+                  onSnapshot: options?.onSnapshot,
+                  onViewportDiagnostics: options?.onViewportDiagnostics,
+                }) as ViewportDatasourceLike;
+              },
+            }}
+            onPushLiveUpdate={() => {
+              const timestamp = Date.now();
+              void collection
+                .applyTransaction({
+                  kind: "upsert",
+                  rows: [
+                    {
+                      id: `live-${timestamp}`,
+                      symbol: `L${String(timestamp).slice(-3)}`,
+                      company: `Live Market ${String(timestamp).slice(-4)}`,
+                      sector: "Technology",
+                      venue: "NASDAQ",
+                      price: 100 + ((timestamp / 1000) % 250),
+                      volume: 50_000,
+                      active: true,
+                      createdAt: new Date(timestamp).toISOString(),
+                      updatedAt: new Date(timestamp).toISOString(),
+                    },
+                  ],
+                })
+                .then(() => undefined);
+            }}
+            onSetStressRate={(rowsPerSecond) => {
+              void collection.setStressRate(rowsPerSecond).then(() => undefined);
+            }}
           />
         ) : (
           <LoadingGridCard
@@ -801,10 +863,14 @@ export function App(props: AppProps) {
             body="The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
             status="Viewport / SQLite Wasm"
             rowLabel="SQLite rows"
-            loadingOverlayTitle="Refreshing SQL query"
-            loadingOverlayBody="Running the latest filter and sort against the worker database."
-            collection={sqliteCollection as unknown as ViewportLikeCollectionHandle}
-            createDatasource={createSqliteViewportDatasource as ViewportDatasourceFactory}
+            useGridLoadingOverlay={false}
+            datasourceClient={sqliteClient}
+            onPushLiveUpdate={() => {
+              sqliteClient.pushLiveUpdate();
+            }}
+            onSetStressRate={(rowsPerSecond) => {
+              sqliteClient.setStressRate(rowsPerSecond);
+            }}
           />
         ) : (
           <LoadingGridCard

@@ -9,27 +9,16 @@ import * as Worker from "@effect/platform/Worker";
 import type { WorkerError } from "@effect/platform/WorkerError";
 
 import type {
-  ApplyTransactionSuccess,
   CloseViewportSessionSuccess,
-  DisposeStoreSuccess,
-  LoadStoreSuccess,
   OpenViewportSessionRequest,
   ReplaceViewportSessionSuccess,
-  StoreDefinition,
-  StoreSource,
-  StoreTransaction,
-  StressState,
   ViewportPatch,
   WorkerRequest,
 } from "./worker-contract";
 import {
-  ApplyTransaction,
   CloseViewportSession,
-  DisposeStore,
-  LoadStore,
   OpenViewportSession,
   ReplaceViewportSession,
-  SetStressRate,
 } from "./worker-contract";
 
 import type { SqliteRow } from "./store-config";
@@ -46,26 +35,13 @@ export interface SqliteViewportSessionHandle<TRow extends SqliteRow = SqliteRow>
   close(): Promise<CloseViewportSessionSuccess>;
 }
 
-export interface SqliteCollectionHandle<TRow extends SqliteRow = SqliteRow> {
+export interface ReadOnlySqliteWorkerClient<TRow extends SqliteRow = SqliteRow> {
   readonly storeId: string;
-  applyTransaction(
-    transaction: StoreTransaction<TRow>,
-  ): Promise<ApplyTransactionSuccess>;
   openViewportSession(
     request: Omit<OpenViewportSessionRequest, "storeId" | "sessionId"> & {
       sessionId?: string;
     },
   ): SqliteViewportSessionHandle<TRow>;
-  setStressRate(rowsPerSecond: number): Promise<StressState>;
-  dispose(): Promise<DisposeStoreSuccess>;
-}
-
-export interface SqliteWorkerClient<TRow extends SqliteRow = SqliteRow> {
-  loadStore(
-    definition: StoreDefinition,
-    source: StoreSource<TRow>,
-  ): Promise<LoadStoreSuccess>;
-  collection(storeId: string): SqliteCollectionHandle<TRow>;
   close(): Promise<void>;
 }
 
@@ -77,9 +53,12 @@ function createSessionId() {
   return `sqlite-viewport-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export async function createSqliteWorkerClient<TRow extends SqliteRow = SqliteRow>(
+export async function createReadOnlySqliteWorkerClient<TRow extends SqliteRow = SqliteRow>(
   spawn: (id: number) => globalThis.Worker | globalThis.SharedWorker | MessagePort,
-): Promise<SqliteWorkerClient<TRow>> {
+  options: {
+    storeId: string;
+  },
+): Promise<ReadOnlySqliteWorkerClient<TRow>> {
   const scope = await Effect.runPromise(Scope.make());
   const worker = await Effect.runPromise(
     Scope.extend(
@@ -89,54 +68,38 @@ export async function createSqliteWorkerClient<TRow extends SqliteRow = SqliteRo
   );
 
   return {
-    loadStore(definition, source) {
-      return Effect.runPromise(worker.executeEffect(new LoadStore({ definition, source })));
-    },
-    collection(storeId) {
+    storeId: options.storeId,
+    openViewportSession(request) {
+      const sessionId = request.sessionId ?? createSessionId();
       return {
-        storeId,
-        applyTransaction(transaction) {
-          return Effect.runPromise(worker.executeEffect(new ApplyTransaction({ storeId, transaction })));
-        },
-        openViewportSession(request) {
-          const sessionId = request.sessionId ?? createSessionId();
-          return {
+        sessionId,
+        updates: worker.execute(
+          new OpenViewportSession({
             sessionId,
-            updates: worker.execute(
-              new OpenViewportSession({
+            storeId: options.storeId,
+            startRow: request.startRow,
+            endRow: request.endRow,
+            query: request.query,
+          }),
+        ),
+        replace(nextRequest) {
+          return Effect.runPromise(
+            worker.executeEffect(
+              new ReplaceViewportSession({
                 sessionId,
-                storeId,
-                startRow: request.startRow,
-                endRow: request.endRow,
-                query: request.query,
+                startRow: nextRequest.startRow,
+                endRow: nextRequest.endRow,
+                query: nextRequest.query,
               }),
             ),
-            replace(nextRequest) {
-              return Effect.runPromise(
-                worker.executeEffect(
-                  new ReplaceViewportSession({
-                    sessionId,
-                    startRow: nextRequest.startRow,
-                    endRow: nextRequest.endRow,
-                    query: nextRequest.query,
-                  }),
-                ),
-              );
-            },
-            close() {
-              return Effect.runPromise(
-                worker.executeEffect(new CloseViewportSession({ sessionId })),
-              );
-            },
-          } as SqliteViewportSessionHandle<TRow>;
+          );
         },
-        setStressRate(rowsPerSecond) {
-          return Effect.runPromise(worker.executeEffect(new SetStressRate({ storeId, rowsPerSecond })));
+        close() {
+          return Effect.runPromise(
+            worker.executeEffect(new CloseViewportSession({ sessionId })),
+          );
         },
-        dispose() {
-          return Effect.runPromise(worker.executeEffect(new DisposeStore({ storeId })));
-        },
-      } as SqliteCollectionHandle<TRow>;
+      } as SqliteViewportSessionHandle<TRow>;
     },
     close() {
       return Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));

@@ -1,7 +1,7 @@
 import { Faker, en } from "@faker-js/faker";
 import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
-import { defineSqliteStore } from "@sandbox/sqlite-store";
+import { defineAgGridSqliteEngine } from "@sandbox/sqlite-store";
 
 const SECTORS = [
   "Technology",
@@ -96,7 +96,7 @@ export function generateMarketRows(rowCount: number, seed = 1): ReadonlyArray<Ma
   return Array.from({ length: rowCount }, () => makeRow());
 }
 
-export const marketSqliteStore = defineSqliteStore({
+export const marketGrid = defineAgGridSqliteEngine({
   table: marketRowsTable,
   rowKey: "id",
   rowFactory: {

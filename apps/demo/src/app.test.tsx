@@ -13,10 +13,7 @@ import type {
   WorkerClient,
   WorkerCollectionHandle,
 } from "@sandbox/worker-store";
-import type {
-  SqliteWorkerClient,
-  ViewportPatch as SqliteViewportPatch,
-} from "@sandbox/sqlite-store";
+import type { AgGridSqliteClient } from "@sandbox/sqlite-store";
 
 import { App } from "./app";
 import type { MarketRow } from "./market-sqlite-store";
@@ -174,68 +171,59 @@ function makeClient(): WorkerClient {
   };
 }
 
-function makeSqliteClient(): SqliteWorkerClient<MarketRow> {
-  const updates = Stream.fromIterable<SqliteViewportPatch<MarketRow>>([{
+function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
+  pushLiveUpdate(): void;
+  setStressRate(rowsPerSecond: number): void;
+} {
+  return {
     storeId: "sqlite-olympic-athletes",
-    startRow: 0,
-    endRow: sampleRows.length,
-    rowCount: sampleRows.length,
-    latencyMs: 8.5,
-    metrics: sampleMetrics,
-    rows: sampleRows,
-  }]);
-
-  return {
-    loadStore: vi.fn().mockResolvedValue({
-      storeId: "sqlite-olympic-athletes",
-      rowCount: sampleRows.length,
-      metrics: sampleMetrics,
-    }),
-    collection: vi.fn().mockReturnValue({
-      storeId: "sqlite-olympic-athletes",
-      applyTransaction: vi.fn().mockResolvedValue({
-        storeId: "sqlite-olympic-athletes",
-        rowCount: sampleRows.length,
-        metrics: sampleMetrics,
-      }),
-      openViewportSession: vi.fn().mockImplementation(() => ({
-        sessionId: "sqlite-viewport-session",
-        updates,
-        replace: vi.fn().mockResolvedValue({
-          sessionId: "sqlite-viewport-session",
-          replaced: true,
-        }),
-        close: vi.fn().mockResolvedValue({
-          sessionId: "sqlite-viewport-session",
-          closed: true,
-        }),
-      })),
-      setStressRate: vi.fn().mockResolvedValue({
-        storeId: "sqlite-olympic-athletes",
-        rowsPerSecond: 0,
-        running: false,
-        rowCount: sampleRows.length,
-        metrics: sampleMetrics,
-      }),
-      dispose: vi.fn().mockResolvedValue({
-        storeId: "sqlite-olympic-athletes",
-        disposed: true,
-      }),
-    }),
-    close: vi.fn().mockResolvedValue(undefined),
-  };
-}
-
-function makePendingSqliteClient(): SqliteWorkerClient<MarketRow> {
-  return {
-    loadStore: vi.fn().mockImplementation(() => new Promise(() => undefined)),
-    collection: vi.fn().mockReturnValue({
-      storeId: "sqlite-olympic-athletes",
-      applyTransaction: vi.fn(),
-      openViewportSession: vi.fn(),
-      setStressRate: vi.fn(),
-      dispose: vi.fn(),
-    }),
+    viewportDatasource: vi.fn().mockImplementation((options?: {
+      onSnapshot?: (snapshot: {
+        startRow: number;
+        endRow: number;
+        rowCount: number;
+        metrics: typeof sampleMetrics;
+      }) => void;
+      onViewportDiagnostics?: (diagnostics: {
+        requestedRange: { startRow: number; endRow: number };
+        fulfilledRange: { startRow: number; endRow: number } | null;
+        requestVersion: number;
+        isLoading: boolean;
+        lastPatchLatencyMs: number | null;
+        ignoredPatchCount: number;
+        patchCount: number;
+      }) => void;
+    }) => ({
+      init(params: {
+        setRowCount(rowCount: number): void;
+        setRowData(rows: Record<number, MarketRow>): void;
+      }) {
+        options?.onSnapshot?.({
+          startRow: 0,
+          endRow: sampleRows.length,
+          rowCount: sampleRows.length,
+          metrics: sampleMetrics,
+        });
+        options?.onViewportDiagnostics?.({
+          requestedRange: { startRow: 0, endRow: 50 },
+          fulfilledRange: { startRow: 0, endRow: sampleRows.length },
+          requestVersion: 1,
+          isLoading: false,
+          lastPatchLatencyMs: 8.5,
+          ignoredPatchCount: 0,
+          patchCount: 1,
+        });
+        params.setRowCount(sampleRows.length);
+        params.setRowData(
+          Object.fromEntries(sampleRows.map((row, index) => [index, row])),
+        );
+      },
+      setViewportRange: vi.fn(),
+      refreshQuery: vi.fn(),
+      destroy: vi.fn(),
+    })),
+    pushLiveUpdate: vi.fn(),
+    setStressRate: vi.fn(),
     close: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -260,8 +248,7 @@ describe("demo app", () => {
     await waitFor(() => {
       expect(client.collection).toHaveBeenCalledWith("olympic-athletes");
       expect(client.loadStore).toHaveBeenCalled();
-      expect(sqliteClient.collection).toHaveBeenCalledWith("sqlite-olympic-athletes");
-      expect(sqliteClient.loadStore).toHaveBeenCalled();
+      expect(sqliteClient.viewportDatasource).toHaveBeenCalled();
     });
 
     await screen.findAllByText(/rows$/);
@@ -288,23 +275,20 @@ describe("demo app", () => {
     expect(
       within(viewportPanel as HTMLElement).getByRole("button", { name: "Stop stress stream" }),
     );
-  });
 
-  it("does not block TanStack panels while the SQLite store is still booting", async () => {
-    const client = makeClient();
-    const sqliteClient = makePendingSqliteClient();
+    const sqliteHeading = (await screen.findAllByRole("heading", { name: "SQLite SQL Viewport" }))[0];
+    const sqlitePanel = sqliteHeading.closest("section");
 
-    render(<App client={client} sqliteClient={sqliteClient} />);
-
-    expect((await screen.findAllByText("Server-Side Pull")).length).toBeGreaterThan(0);
-    expect((await screen.findAllByText("Viewport Push")).length).toBeGreaterThan(0);
-    expect((await screen.findAllByText("SQLite SQL Viewport")).length).toBeGreaterThan(0);
-    await screen.findAllByText("Ada Insights Holdings");
-
+    expect(sqlitePanel).not.toBeNull();
+    await within(sqlitePanel as HTMLElement).findByRole("slider", {
+      name: "Rows per second",
+    });
     expect(
-      screen.getByText(
-        "Starting the SQLite worker store in the background. TanStack panels stay interactive while it catches up.",
-      ),
-    ).not.toBeNull();
+      within(sqlitePanel as HTMLElement).getByRole("button", { name: "Push live update" }),
+    );
+    expect(
+      within(sqlitePanel as HTMLElement).getByRole("button", { name: "Stop stress stream" }),
+    );
   });
+
 });

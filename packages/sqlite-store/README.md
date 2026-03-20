@@ -1,56 +1,32 @@
 # `@sandbox/sqlite-store`
 
-`@sandbox/sqlite-store` is a small AG Grid viewport-store library built around:
+`@sandbox/sqlite-store` is an AG Grid-first SQLite Wasm worker engine.
 
-- one Drizzle SQLite schema
-- one in-memory SQLite Wasm database in a worker
-- one straightforward RPC model
+It is built for the viewport row model:
 
-It is intentionally not a live-query engine. Query changes run immediately. Write-driven refreshes are coalesced and re-run as normal SQL.
+- define one Drizzle SQLite table
+- infer the row type once from that table
+- run count + window SQL inside a worker
+- keep the main thread read-only
+- coalesce write-driven refreshes in the worker
 
-## Goals
+This package is intentionally not a generic database client and not a live-query engine.
 
-- define the row shape once with Drizzle
-- import the inferred row type on the main thread
-- keep the worker runtime simple
-- avoid collection hydration, subscription graphs, and engine-specific patch logic
-- work cleanly with AG Grid viewport row model
+## API
 
-## Core Model
+The public API is deliberately small:
 
-The worker owns a SQLite table and exposes a small set of operations:
+- `defineAgGridSqliteEngine(...)`
+- `engine.createWorkerRuntime(...)`
+- `engine.connect(...)`
 
-- `loadStore`
-- `applyTransaction`
-- `openViewportSession`
-- `replaceViewportSession`
-- `closeViewportSession`
-- `setStressRate`
+The main thread should only connect and hand the returned datasource to AG Grid.
 
-Viewport requests are plain query RPCs:
-
-- initial open runs `count + rows`
-- range changes run `count + rows` immediately
-- sort/filter changes run `count + rows` immediately
-- write churn marks sessions dirty and coalesces refreshes to one full patch per throttle window
-
-Every emitted viewport patch contains:
-
-- requested `startRow` / `endRow`
-- full visible window rows
-- total row count
-- worker commit metrics
-- query latency
-
-There is no incremental diff protocol in this package.
-
-## Define A Store
-
-Create one Drizzle SQLite table and pass it to `defineSqliteStore`.
+## Define An Engine
 
 ```ts
 import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
-import { defineSqliteStore } from "@sandbox/sqlite-store";
+import { defineAgGridSqliteEngine } from "@sandbox/sqlite-store";
 
 export const marketRowsTable = sqliteTable("market_rows", {
   id: text("id").primaryKey(),
@@ -63,113 +39,68 @@ export const marketRowsTable = sqliteTable("market_rows", {
 
 export type MarketRow = typeof marketRowsTable.$inferSelect;
 
-export const marketSqliteStore = defineSqliteStore({
+export const marketGrid = defineAgGridSqliteEngine({
   table: marketRowsTable,
   rowKey: "id",
 });
 ```
 
-`defineSqliteStore(...)` derives:
+That single Drizzle table drives:
 
+- the row type
 - table name
-- SQL column names
-- `SELECT` list with aliases
-- `CREATE TABLE` DDL
-- `UPSERT` SQL
+- SQL column mapping
+- create-table DDL
+- upsert SQL
 - delete-by-key SQL
-- row encoding/decoding for SQLite
-- default sort fallback from `rowKey`
+- fallback sort key
 
-## Optional Worker-Side Row Factories
+## Worker Runtime
 
-If you want worker-side bootstrap or demo stress writes, add row factory hooks:
-
-```ts
-export const marketSqliteStore = defineSqliteStore({
-  table: marketRowsTable,
-  rowKey: "id",
-  rowFactory: {
-    generateRows(rowCount, seed) {
-      return generateMarketRows(rowCount, seed ?? 1);
-    },
-    createStressRowFactory(seed, startIndex, options) {
-      return createMarketRowFactory(seed, startIndex, options);
-    },
-  },
-});
-```
-
-If you do not provide these hooks:
-
-- `loadStore({ kind: "generator" })` will fail
-- `setStressRate(...)` will fail
-
-For app code that already has real rows, use `kind: "rows"` and skip row factories entirely.
-
-## Worker Setup
-
-Launch the worker with the store definition:
+Writes and ingestion live in the worker runtime, not in the browser API.
 
 ```ts
 import * as Effect from "effect/Effect";
-import { launchSqliteBrowserWorker } from "@sandbox/sqlite-store";
-import { marketSqliteStore } from "./market-sqlite-store";
+import { marketGrid } from "./market-sqlite-store";
 
-Effect.runFork(launchSqliteBrowserWorker(marketSqliteStore));
-```
-
-You can also create a registry or handler layer directly:
-
-- `new StoreRegistry(marketSqliteStore, options?)`
-- `createSqliteWorkerHandlers(marketSqliteStore, registry?)`
-- `makeSqliteWorkerLayer(marketSqliteStore, registry?)`
-
-## Main Thread Client
-
-On the main thread, create the worker client and parameterize it with the inferred row type:
-
-```ts
-import { createSqliteWorkerClient } from "@sandbox/sqlite-store";
-import type { MarketRow } from "./market-sqlite-store";
-
-const client = await createSqliteWorkerClient<MarketRow>(
-  () => new Worker(new URL("./sqlite.worker.ts", import.meta.url), { type: "module" }),
-);
-```
-
-Load a store:
-
-```ts
-await client.loadStore(
-  { storeId: "market" },
-  { kind: "rows", rows },
-);
-```
-
-Or, if your store definition includes `rowFactory.generateRows(...)`:
-
-```ts
-await client.loadStore(
-  { storeId: "market" },
-  { kind: "generator", rowCount: 100_000, seed: 7 },
-);
-```
-
-Then get a collection handle:
-
-```ts
-const collection = client.collection("market");
-```
-
-## AG Grid Viewport Datasource
-
-Use `createSqliteViewportDatasource(...)` with the collection handle:
-
-```ts
-import { createSqliteViewportDatasource } from "@sandbox/sqlite-store";
-
-const datasource = createSqliteViewportDatasource(collection, {
+const runtime = marketGrid.createWorkerRuntime({
   storeId: "market",
+});
+
+Effect.runFork(
+  Effect.gen(function* () {
+    yield* Effect.promise(() => runtime.replaceAll(seedRows));
+    yield* runtime.launchBrowserWorker();
+  }),
+);
+```
+
+Worker runtime methods:
+
+- `replaceAll(rows)`
+- `upsert(rows)`
+- `delete(ids)`
+- `setStressRate(rowsPerSecond)` for demo-style worker-owned write churn
+- `launchBrowserWorker()`
+
+The worker runtime owns:
+
+- SQLite DB creation
+- table bootstrap
+- row writes
+- viewport session refresh scheduling
+
+## Main Thread
+
+The browser side is read-only.
+
+```ts
+const market = await marketGrid.connect(
+  () => new Worker(new URL("./sqlite.worker.ts", import.meta.url), { type: "module" }),
+  { storeId: "market" },
+);
+
+const datasource = market.viewportDatasource({
   onSnapshot(snapshot) {
     console.log(snapshot.rowCount, snapshot.metrics);
   },
@@ -179,61 +110,76 @@ const datasource = createSqliteViewportDatasource(collection, {
 });
 ```
 
-The datasource keeps the AG Grid integration simple:
+Main-thread surface:
 
-- immediate refresh for normal query changes
-- optional debounce for floating-filter typing
-- loading overlay only for actual query refresh
-- no invalid range calls during startup
+- `viewportDatasource(options?)`
+- `close()`
 
-## Query Translation
+It does not expose:
 
-`sqlite-store` expects a `GridQueryState` from `@sandbox/ag-grid-translator`.
+- `loadStore`
+- `applyTransaction`
+- `collection(...)`
+- `openViewportSession(...)`
 
-The SQL planner:
+Those are internal worker concerns.
 
-- validates fields against the Drizzle table columns
-- maps AG Grid field ids to SQL column names
-- translates supported predicates to SQLite SQL with positional `?` params
-- uses the configured `rowKey` as the stable fallback sort
+## AG Grid Usage
 
-This means you do not maintain a second handwritten column map for normal table fields.
+```ts
+<AgGridReact<Row>
+  rowModelType="viewport"
+  viewportDatasource={market.viewportDatasource()}
+  getRowId={(params) => String(params.data.id)}
+/>
+```
 
-## What Is Generic And What Is Not
+The datasource behavior is simple:
 
-Generic:
+- initial open runs `count + rows`
+- sort changes rerun immediately
+- filter changes rerun immediately
+- floating-filter typing can debounce
+- write churn triggers one coalesced rerun per throttle window
+- every patch is a full visible window plus row count
 
-- table name
-- column names
-- selected row type
-- default row key
-- worker-side row encoding/decoding
-- SQL planner field lookup
+There is no incremental diff protocol.
 
-Not generic:
+## Worker-Owned Demo Controls
 
-- AG Grid still needs field names that match your selected row shape
-- runtime row payloads across the worker boundary are treated as opaque row objects
-- dynamic query translation is still plain SQL, not Drizzle query-builder chaining
+If an app wants demo-only write controls such as stress sliders or “push live update”, keep that bridge app-local.
 
-That tradeoff is deliberate. The Drizzle table is the source of truth for schema and types, and the SQL planner stays small and direct.
+For example:
 
-## Why Raw SQL Instead Of Drizzle Queries
+- create the worker in app code
+- call `engine.connect(() => worker, { storeId })`
+- send app-specific `postMessage(...)` commands to the worker
+- let the worker file call `runtime.upsert(...)` or `runtime.setStressRate(...)`
 
-Drizzle is used here for:
+That keeps the package API read-only while still allowing app-local mutation demos.
 
-- schema definition
-- inferred row types
-- runtime table metadata
+## Query Model
 
-The viewport query path still uses raw SQL because AG Grid filter and sort state is highly dynamic. Building `WHERE`, `ORDER BY`, `LIMIT`, and `OFFSET` directly is simpler and more predictable than trying to express the same runtime shape through a higher-level query builder.
+`sqlite-store` expects `GridQueryState` from `@sandbox/ag-grid-translator`.
+
+The worker planner translates that to SQLite SQL with positional `?` params:
+
+- supported AG Grid filter operators
+- nested `and` / `or`
+- dynamic `ORDER BY`
+- `LIMIT` / `OFFSET`
+- stable fallback ordering via `rowKey`
+
+Drizzle is used for schema and type inference, not for the runtime viewport query builder.
 
 ## Design Constraints
 
-- no live-query subscription model
-- no incremental patch graph
+- AG Grid viewport row model is the primary use case
+- main-thread API is read-only
+- no live-query subscription graph
+- no incremental patch engine
 - no secondary indexes by default
 - no persistence by default
 - no `Effect/sql` adapter in v1
 
-The package favors simple worker ownership and fast rerun queries over a more elaborate database abstraction.
+The package favors a small API and fast rerun queries over a more elaborate abstraction layer.
