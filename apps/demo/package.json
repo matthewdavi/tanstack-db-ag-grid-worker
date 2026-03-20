@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@sandbox/ag-grid-translator": "workspace:*",
+    "@sandbox/sqlite-store": "workspace:*",
     "@sandbox/worker-store": "workspace:*",
     "@tanstack/react-db": "^0.1.75",
     "ag-grid-community": "^35.1.0",

@@ -10,6 +10,7 @@ import type {
   GridApi,
   GridReadyEvent,
   GetRowIdParams,
+  IViewportDatasource,
   StatusBar,
 } from "ag-grid-community";
 import { ModuleRegistry as AgGridModuleRegistry } from "ag-grid-community";
@@ -23,13 +24,17 @@ import {
   createServerSideDatasource,
   createViewportDatasource,
   createWorkerClient,
-  type RowRecord,
-  type StoreMetrics,
-  type ViewportDiagnostics,
-  type ViewportDatasourceHandle,
   type WorkerClient,
   type WorkerCollectionHandle,
 } from "@sandbox/worker-store";
+import { translateAgGridQuery } from "@sandbox/ag-grid-translator";
+import {
+  createSqliteViewportDatasource,
+  createSqliteWorkerClient,
+  type RowRecord as MarketRow,
+  type SqliteCollectionHandle,
+  type SqliteWorkerClient,
+} from "@sandbox/sqlite-store";
 
 const licenseKey = import.meta.env.VITE_AG_GRID_LICENSE_KEY;
 if (typeof licenseKey === "string" && licenseKey.length > 0) {
@@ -39,19 +44,98 @@ if (typeof licenseKey === "string" && licenseKey.length > 0) {
 AgGridModuleRegistry.registerModules([AllEnterpriseModule]);
 
 const STORE_ID = "olympic-athletes";
+const SQLITE_STORE_ID = "sqlite-olympic-athletes";
 const ROW_KEY = "id";
 const INITIAL_DEMO_ROW_COUNT = 100_000;
-const VIEWPORT_LOADING_OVERLAY = `
-  <div class="viewport-loading-overlay" role="status" aria-live="polite">
-    <span class="viewport-loading-overlay__pulse"></span>
-    <div class="viewport-loading-overlay__copy">
-      <strong>Refreshing live query</strong>
-      <span>Recomputing filters and sort in the worker.</span>
+function createViewportLoadingOverlay(title: string, body: string) {
+  return `
+    <div class="viewport-loading-overlay" role="status" aria-live="polite">
+      <span class="viewport-loading-overlay__pulse"></span>
+      <div class="viewport-loading-overlay__copy">
+        <strong>${title}</strong>
+        <span>${body}</span>
+      </div>
     </div>
-  </div>
-`;
+  `;
+}
 
-const COLUMN_DEFS: ReadonlyArray<ColDef<RowRecord>> = [
+interface WorkerMetrics {
+  lastCommitDurationMs: number | null;
+  lastCommitChangeCount: number;
+  totalCommitCount: number;
+}
+
+interface ViewportStateDiagnostics {
+  requestedRange: {
+    startRow: number;
+    endRow: number;
+  };
+  fulfilledRange: {
+    startRow: number;
+    endRow: number;
+  } | null;
+  requestVersion: number;
+  isLoading: boolean;
+  lastPatchLatencyMs: number | null;
+  ignoredPatchCount: number;
+  patchCount: number;
+}
+
+interface ViewportLikeSessionHandle {
+  replace(request: {
+    startRow: number;
+    endRow: number;
+    query: ReturnType<typeof translateQuery>;
+  }): Promise<unknown>;
+  close(): Promise<unknown>;
+}
+
+interface ViewportLikeCollectionHandle {
+  storeId: string;
+  applyTransaction(transaction: {
+    kind: "upsert";
+    rows: ReadonlyArray<MarketRow>;
+  }): Promise<unknown>;
+  openViewportSession(request: {
+    startRow: number;
+    endRow: number;
+    query: ReturnType<typeof translateQuery>;
+    sessionId?: string;
+  }): ViewportLikeSessionHandle & {
+    updates: any;
+    sessionId: string;
+  };
+  setStressRate(rowsPerSecond: number): Promise<unknown>;
+}
+
+function translateQuery(filterModel: unknown, sortModel: unknown) {
+  return translateAgGridQuery({
+    filterModel,
+    sortModel,
+  });
+}
+
+type ViewportDatasourceLike = IViewportDatasource & {
+  refreshQuery(options?: {
+    debounce?: boolean;
+  }): void;
+};
+
+type ViewportDatasourceFactory = (
+  collection: Pick<ViewportLikeCollectionHandle, "openViewportSession">,
+  options: {
+    storeId: string;
+    onSnapshot?: (snapshot: {
+      startRow: number;
+      endRow: number;
+      rowCount: number;
+      metrics: WorkerMetrics;
+    }) => void;
+    onViewportDiagnostics?: (diagnostics: ViewportStateDiagnostics) => void;
+  },
+) => ViewportDatasourceLike;
+
+const COLUMN_DEFS: ReadonlyArray<ColDef<MarketRow>> = [
   {
     field: "symbol",
     minWidth: 120,
@@ -89,7 +173,7 @@ const COLUMN_DEFS: ReadonlyArray<ColDef<RowRecord>> = [
   },
 ];
 
-const DEFAULT_COL_DEF: ColDef<RowRecord> = {
+const DEFAULT_COL_DEF: ColDef<MarketRow> = {
   sortable: true,
   filter: true,
   floatingFilter: true,
@@ -98,7 +182,7 @@ const DEFAULT_COL_DEF: ColDef<RowRecord> = {
   minWidth: 120,
 };
 
-const getStableRowId = (params: GetRowIdParams<RowRecord>) =>
+const getStableRowId = (params: GetRowIdParams<MarketRow>) =>
   params.data ? String(params.data.id) : "";
 
 interface WorkerRowCountStatusPanelProps {
@@ -107,7 +191,7 @@ interface WorkerRowCountStatusPanelProps {
   commitSummary: string;
 }
 
-function formatCommitSummary(metrics: StoreMetrics) {
+function formatCommitSummary(metrics: WorkerMetrics) {
   if (metrics.lastCommitDurationMs === null) {
     return "Awaiting worker commit";
   }
@@ -129,7 +213,7 @@ function WorkerRowCountStatusPanel(props: WorkerRowCountStatusPanelProps) {
 function createRowCountStatusBar(
   label: string,
   rowCount: number,
-  metrics: StoreMetrics,
+  metrics: WorkerMetrics,
 ): StatusBar {
   return {
     statusPanels: [
@@ -169,8 +253,20 @@ function makeBrowserWorkerClient() {
   );
 }
 
-function useSandboxClient(externalClient?: WorkerClient) {
-  const [client, setClient] = useState<WorkerClient | null>(externalClient ?? null);
+function makeBrowserSqliteWorkerClient() {
+  return createSqliteWorkerClient(
+    () =>
+      new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
+        type: "module",
+      }),
+  );
+}
+
+function useWorkerClient<TClient extends { close(): Promise<void> }>(
+  externalClient: TClient | undefined,
+  factory: () => Promise<TClient>,
+) {
+  const [client, setClient] = useState<TClient | null>(externalClient ?? null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -181,9 +277,9 @@ function useSandboxClient(externalClient?: WorkerClient) {
     }
 
     let cancelled = false;
-    let activeClient: WorkerClient | null = null;
+    let activeClient: TClient | null = null;
 
-    void makeBrowserWorkerClient()
+    void factory()
       .then((nextClient) => {
         if (cancelled) {
           void nextClient.close();
@@ -209,12 +305,15 @@ function useSandboxClient(externalClient?: WorkerClient) {
         void activeClient.close();
       }
     };
-  }, [externalClient]);
+  }, [externalClient, factory]);
 
   return { client, error };
 }
 
-function useStoreBootstrap(client: WorkerClient | null) {
+function useStoreBootstrap(
+  client: Pick<WorkerClient, "loadStore"> | Pick<SqliteWorkerClient, "loadStore"> | null,
+  storeId: string,
+) {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -229,7 +328,7 @@ function useStoreBootstrap(client: WorkerClient | null) {
     void client
       .loadStore(
         {
-          storeId: STORE_ID,
+          storeId,
           rowKey: ROW_KEY,
         },
         {
@@ -263,7 +362,7 @@ function useStoreBootstrap(client: WorkerClient | null) {
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, storeId]);
 
   return { ready, error };
 }
@@ -290,14 +389,35 @@ function GridCard(props: GridCardProps) {
   );
 }
 
+interface LoadingGridCardProps {
+  title: string;
+  body: string;
+  status: string;
+  message: string;
+}
+
+function LoadingGridCard(props: LoadingGridCardProps) {
+  return (
+    <GridCard
+      title={props.title}
+      body={props.body}
+      status={props.status}
+    >
+      <div className="panel-empty-state">
+        <p>{props.message}</p>
+      </div>
+    </GridCard>
+  );
+}
+
 interface ServerSideGridPanelProps {
   collection: WorkerCollectionHandle;
 }
 
 function ServerSideGridPanel(props: ServerSideGridPanelProps) {
-  const apiRef = useRef<GridApi<RowRecord> | null>(null);
+  const apiRef = useRef<GridApi<MarketRow> | null>(null);
   const [rowCount, setRowCount] = useState(0);
-  const [metrics, setMetrics] = useState<StoreMetrics>({
+  const [metrics, setMetrics] = useState<WorkerMetrics>({
     lastCommitDurationMs: null,
     lastCommitChangeCount: 0,
     totalCommitCount: 0,
@@ -322,7 +442,7 @@ function ServerSideGridPanel(props: ServerSideGridPanelProps) {
     );
   }, [props.collection]);
 
-  const handleReady = (event: GridReadyEvent<RowRecord>) => {
+  const handleReady = (event: GridReadyEvent<MarketRow>) => {
     apiRef.current = event.api;
     event.api.setGridOption(
       "serverSideDatasource",
@@ -345,8 +465,8 @@ function ServerSideGridPanel(props: ServerSideGridPanelProps) {
       status="SSRM / pull model"
     >
       <div className="grid-shell ag-theme-quartz">
-        <AgGridReact<RowRecord>
-          columnDefs={COLUMN_DEFS as ColDef<RowRecord>[]}
+        <AgGridReact<MarketRow>
+          columnDefs={COLUMN_DEFS as ColDef<MarketRow>[]}
           defaultColDef={DEFAULT_COL_DEF}
           rowModelType="serverSide"
           cacheBlockSize={50}
@@ -362,20 +482,27 @@ function ServerSideGridPanel(props: ServerSideGridPanelProps) {
 }
 
 interface ViewportGridPanelProps {
-  collection: WorkerCollectionHandle;
+  title: string;
+  body: string;
+  status: string;
+  rowLabel: string;
+  loadingOverlayTitle: string;
+  loadingOverlayBody: string;
+  collection: ViewportLikeCollectionHandle;
+  createDatasource: ViewportDatasourceFactory;
 }
 
 function ViewportGridPanel(props: ViewportGridPanelProps) {
-  const apiRef = useRef<GridApi<RowRecord> | null>(null);
-  const datasourceRef = useRef<ViewportDatasourceHandle | null>(null);
+  const apiRef = useRef<GridApi<MarketRow> | null>(null);
+  const datasourceRef = useRef<ViewportDatasourceLike | null>(null);
   const [rowsPerSecond, setRowsPerSecond] = useState(0);
   const [rowCount, setRowCount] = useState(0);
-  const [metrics, setMetrics] = useState<StoreMetrics>({
+  const [metrics, setMetrics] = useState<WorkerMetrics>({
     lastCommitDurationMs: null,
     lastCommitChangeCount: 0,
     totalCommitCount: 0,
   });
-  const [diagnostics, setDiagnostics] = useState<ViewportDiagnostics>({
+  const [diagnostics, setDiagnostics] = useState<ViewportStateDiagnostics>({
     requestedRange: {
       startRow: 0,
       endRow: 50,
@@ -397,7 +524,7 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
       return;
     }
 
-    const datasource = createViewportDatasource(props.collection, {
+    const datasource = props.createDatasource(props.collection, {
       storeId: props.collection.storeId,
       onSnapshot: (snapshot) => {
         startTransition(() => {
@@ -419,9 +546,9 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
     apiRef.current.setGridOption("loading", diagnostics.isLoading);
   }, [props.collection]);
 
-  const handleReady = (event: GridReadyEvent<RowRecord>) => {
+  const handleReady = (event: GridReadyEvent<MarketRow>) => {
     apiRef.current = event.api;
-    const datasource = createViewportDatasource(props.collection, {
+    const datasource = props.createDatasource(props.collection, {
       storeId: props.collection.storeId,
       onSnapshot: (snapshot) => {
         startTransition(() => {
@@ -449,7 +576,7 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
     datasourceRef.current?.refreshQuery(options);
   };
 
-  const handleFilterChanged = (event: FilterChangedEvent<RowRecord>) => {
+  const handleFilterChanged = (event: FilterChangedEvent<MarketRow>) => {
     refreshViewport({
       debounce: event.afterFloatingFilter === true,
     });
@@ -492,9 +619,9 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
 
   return (
     <GridCard
-      title="Viewport Push"
-      body="The grid only owns the visible slice. The worker keeps the live query hot and streams patches back through the viewport datasource."
-      status="Viewport / push model"
+      title={props.title}
+      body={props.body}
+      status={props.status}
     >
       <div className="panel-actions">
         <button
@@ -558,13 +685,16 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
         </span>
       </div>
       <div className="grid-shell grid-shell--viewport ag-theme-quartz">
-        <AgGridReact<RowRecord>
-          columnDefs={COLUMN_DEFS as ColDef<RowRecord>[]}
+        <AgGridReact<MarketRow>
+          columnDefs={COLUMN_DEFS as ColDef<MarketRow>[]}
           defaultColDef={DEFAULT_COL_DEF}
           getRowId={getStableRowId}
-          overlayLoadingTemplate={VIEWPORT_LOADING_OVERLAY}
+          overlayLoadingTemplate={createViewportLoadingOverlay(
+            props.loadingOverlayTitle,
+            props.loadingOverlayBody,
+          )}
           rowModelType="viewport"
-          statusBar={createRowCountStatusBar("Worker rows", rowCount, metrics)}
+          statusBar={createRowCountStatusBar(props.rowLabel, rowCount, metrics)}
           viewportRowModelPageSize={50}
           viewportRowModelBufferSize={20}
           rowBuffer={0}
@@ -581,22 +711,34 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
 
 export interface AppProps {
   client?: WorkerClient;
+  sqliteClient?: SqliteWorkerClient;
 }
 
 export function App(props: AppProps) {
-  const { client, error: clientError } = useSandboxClient(props.client);
-  const { ready, error: bootstrapError } = useStoreBootstrap(client);
+  const { client, error: clientError } = useWorkerClient(props.client, makeBrowserWorkerClient);
+  const { client: sqliteClient, error: sqliteClientError } = useWorkerClient(
+    props.sqliteClient,
+    makeBrowserSqliteWorkerClient,
+  );
+  const { ready, error: bootstrapError } = useStoreBootstrap(client, STORE_ID);
+  const { ready: sqliteReady, error: sqliteBootstrapError } = useStoreBootstrap(
+    sqliteClient,
+    SQLITE_STORE_ID,
+  );
   const collection = client ? client.collection(STORE_ID) : null;
+  const sqliteCollection = sqliteClient ? sqliteClient.collection(SQLITE_STORE_ID) : null;
+  const tanstackReady = ready && collection !== null;
+  const sqliteStoreReady = sqliteReady && sqliteCollection !== null;
 
   return (
     <main className="app-shell">
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">worker-hosted tanstack db + ag grid enterprise</p>
-          <h1>One authoritative row store, two row models, zero main-thread ownership.</h1>
+          <p className="eyebrow">worker-hosted query engines + ag grid enterprise</p>
+          <h1>Same grid, two worker-side query engines, one direct comparison.</h1>
           <p>
-            Filters and sorting are decoded in the translator package, normalized into a
-            single query state, and executed inside the worker-backed store.
+            Filters and sorting are decoded once, then executed inside either the TanStack
+            worker store or a SQLite Wasm worker store.
           </p>
         </div>
         <dl className="hero-metrics">
@@ -606,7 +748,7 @@ export function App(props: AppProps) {
           </div>
           <div>
             <dt>Query compiler</dt>
-            <dd>AG Grid to TanStack DB</dd>
+            <dd>AG Grid to TanStack DB and AG Grid to SQL</dd>
           </div>
           <div>
             <dt>Dataset</dt>
@@ -616,23 +758,61 @@ export function App(props: AppProps) {
       </section>
 
       {clientError ? <p className="error-banner">{clientError}</p> : null}
+      {sqliteClientError ? <p className="error-banner">{sqliteClientError}</p> : null}
       {bootstrapError ? <p className="error-banner">{bootstrapError}</p> : null}
-      {!ready || collection === null ? (
-        <section className="loading-card">
-          <p className="eyebrow">booting</p>
-          <h2>Starting worker store</h2>
-          <p>The dataset is being generated inside the worker before the grids attach.</p>
-        </section>
-      ) : (
-        <section className="grid-stack">
+      {sqliteBootstrapError ? <p className="error-banner">{sqliteBootstrapError}</p> : null}
+      <section className="grid-stack">
+        {tanstackReady ? (
           <ServerSideGridPanel
             collection={collection}
           />
-          <ViewportGridPanel
-            collection={collection}
+        ) : (
+          <LoadingGridCard
+            title="Server-Side Pull"
+            body="AG Grid asks for row windows, the worker resolves the translated query, and SSRM stays ignorant of the full dataset."
+            status="SSRM / pull model"
+            message="Starting the TanStack worker store and generating the shared dataset."
           />
-        </section>
-      )}
+        )}
+        {tanstackReady ? (
+          <ViewportGridPanel
+            title="Viewport Push"
+            body="The grid only owns the visible slice. The TanStack worker keeps the live query hot and streams patches back through the viewport datasource."
+            status="Viewport / TanStack push"
+            rowLabel="TanStack rows"
+            loadingOverlayTitle="Refreshing live query"
+            loadingOverlayBody="Recomputing filters and sort in the worker."
+            collection={collection}
+            createDatasource={createViewportDatasource as ViewportDatasourceFactory}
+          />
+        ) : (
+          <LoadingGridCard
+            title="Viewport Push"
+            body="The grid only owns the visible slice. The TanStack worker keeps the live query hot and streams patches back through the viewport datasource."
+            status="Viewport / TanStack push"
+            message="Waiting for the TanStack viewport store to finish booting."
+          />
+        )}
+        {sqliteStoreReady ? (
+          <ViewportGridPanel
+            title="SQLite SQL Viewport"
+            body="The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
+            status="Viewport / SQLite Wasm"
+            rowLabel="SQLite rows"
+            loadingOverlayTitle="Refreshing SQL query"
+            loadingOverlayBody="Running the latest filter and sort against the worker database."
+            collection={sqliteCollection as unknown as ViewportLikeCollectionHandle}
+            createDatasource={createSqliteViewportDatasource as ViewportDatasourceFactory}
+          />
+        ) : (
+          <LoadingGridCard
+            title="SQLite SQL Viewport"
+            body="The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
+            status="Viewport / SQLite Wasm"
+            message="Starting the SQLite worker store in the background. TanStack panels stay interactive while it catches up."
+          />
+        )}
+      </section>
     </main>
   );
 }
