@@ -11,7 +11,11 @@ import type {
 } from "ag-grid-community";
 
 import { createSqliteViewportDatasource } from "./ag-grid-adapters";
-import type { RowRecord } from "./row-schema";
+
+type TestRow = {
+  id: string;
+  symbol: string;
+};
 
 function makeViewportParams() {
   return {
@@ -23,7 +27,7 @@ function makeViewportParams() {
     setRowCount: vi.fn(),
     setRowData: vi.fn(),
     getRow: vi.fn(),
-  } as IViewportDatasourceParams<RowRecord>;
+  } as IViewportDatasourceParams<TestRow>;
 }
 
 describe("sqlite ag-grid adapter", () => {

@@ -1,10 +1,27 @@
 import { describe, expect, it } from "vitest";
+import { sqliteTable, integer, real, text } from "drizzle-orm/sqlite-core";
 
+import { defineSqliteStore } from "./store-config";
 import { planViewportQuery } from "./sql-planner";
+
+const inventoryTable = sqliteTable("inventory_items", {
+  sku: text("sku").primaryKey(),
+  label: text("label").notNull(),
+  quantity: integer("quantity").notNull(),
+  price: real("unit_price").notNull(),
+  active: integer("is_active", { mode: "boolean" }).notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+const inventoryStore = defineSqliteStore({
+  table: inventoryTable,
+  rowKey: "sku",
+});
 
 describe("sqlite sql planner", () => {
   it("builds count and rows SQL for sorted viewport queries", () => {
     const plan = planViewportQuery(
+      inventoryStore,
       {
         predicate: null,
         sorts: [{ field: "price", direction: "asc" }],
@@ -15,14 +32,15 @@ describe("sqlite sql planner", () => {
       },
     );
 
-    expect(plan.countSql).toBe(`select count(*) as count from "demo_rows"`);
-    expect(plan.rowsSql).toContain(`order by "price" asc`);
+    expect(plan.countSql).toBe(`select count(*) as count from "inventory_items"`);
+    expect(plan.rowsSql).toContain(`order by "unit_price" asc`);
     expect(plan.rowsSql).toContain(`limit ? offset ?`);
     expect(plan.rowsParams).toEqual([15, 10]);
   });
 
   it("supports nested predicate groups and stable default ordering", () => {
     const plan = planViewportQuery(
+      inventoryStore,
       {
         predicate: {
           kind: "group",
@@ -30,31 +48,30 @@ describe("sqlite sql planner", () => {
           predicates: [
             {
               kind: "comparison",
-              field: "sector",
-              filterType: "text",
-              operator: "eq",
-              value: "Technology",
-            },
-            {
-              kind: "group",
-              operator: "or",
-              predicates: [
-                {
-                  kind: "comparison",
-                  field: "symbol",
-                  filterType: "text",
-                  operator: "startsWith",
-                  value: "A",
-                },
-                {
-                  kind: "comparison",
-                  field: "company",
-                  filterType: "text",
-                  operator: "contains",
-                  value: "Labs",
-                },
-              ],
-            },
+                field: "active",
+                filterType: "text",
+                operator: "true",
+              },
+              {
+                kind: "group",
+                operator: "or",
+                predicates: [
+                  {
+                    kind: "comparison",
+                    field: "label",
+                    filterType: "text",
+                    operator: "startsWith",
+                    value: "A",
+                  },
+                  {
+                    kind: "comparison",
+                    field: "updatedAt",
+                    filterType: "text",
+                    operator: "contains",
+                    value: "2026",
+                  },
+                ],
+              },
           ],
         },
         sorts: [],
@@ -66,10 +83,10 @@ describe("sqlite sql planner", () => {
     );
 
     expect(plan.countSql).toContain(
-      `where ("sector" = ? and (lower("symbol") like ? escape '\\' or lower("company") like ? escape '\\'))`,
+      `where ("is_active" = true and (lower("label") like ? escape '\\' or lower("updated_at") like ? escape '\\'))`,
     );
-    expect(plan.countParams).toEqual(["Technology", "a%", "%labs%"]);
-    expect(plan.rowsSql).toContain(`order by "id" asc`);
-    expect(plan.rowsParams).toEqual(["Technology", "a%", "%labs%", 50, 0]);
+    expect(plan.countParams).toEqual(["a%", "%2026%"]);
+    expect(plan.rowsSql).toContain(`order by "sku" asc`);
+    expect(plan.rowsParams).toEqual(["a%", "%2026%", 50, 0]);
   });
 });

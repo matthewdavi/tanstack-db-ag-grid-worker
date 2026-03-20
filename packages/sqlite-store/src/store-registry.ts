@@ -15,8 +15,7 @@ import * as Stream from "effect/Stream";
 
 import type { GridQueryState } from "@sandbox/ag-grid-translator";
 
-import { createDemoRowFactory, generateDemoRows } from "./demo-data";
-import type { RowRecord } from "./row-schema";
+import type { SqliteRow, SqliteStoreDefinition } from "./store-config";
 import { planViewportQuery } from "./sql-planner";
 import type {
   ApplyTransactionSuccess,
@@ -42,11 +41,10 @@ type SqliteDatabaseFactory = (
 const DEFAULT_STRESS_TICK_MS = 100;
 const DEFAULT_WRITE_REFRESH_THROTTLE_MS = 100;
 
-interface StoreEntry {
+interface StoreEntry<TRow extends SqliteRow = SqliteRow> {
   readonly storeId: string;
-  readonly rowKey: string;
   readonly db: SqliteDatabase;
-  readonly makeStressRow: () => RowRecord;
+  readonly makeStressRow: (() => TRow) | null;
   rowCount: number;
   rowsPerSecond: number;
   metrics: StoreMetrics;
@@ -59,10 +57,10 @@ interface ViewportRequest {
   query: GridQueryState;
 }
 
-interface ViewportSession {
+interface ViewportSession<TRow extends SqliteRow = SqliteRow> {
   readonly sessionId: string;
   readonly storeId: string;
-  readonly queue: Queue.Queue<ViewportPatch>;
+  readonly queue: Queue.Queue<ViewportPatch<TRow>>;
   request: ViewportRequest;
   runId: number;
   inFlightCount: number;
@@ -92,75 +90,20 @@ function asViewportRequest(
   };
 }
 
-function createPlaceholders(count: number) {
-  return Array.from({ length: count }, () => "?").join(", ");
-}
-
-function normalizeRow(row: Record<string, unknown>): RowRecord {
-  return {
-    id: String(row.id),
-    active: Boolean(row.active),
-    symbol: String(row.symbol),
-    company: String(row.company),
-    sector: String(row.sector),
-    venue: String(row.venue),
-    price: Number(row.price),
-    volume: Number(row.volume),
-    createdAt: String(row.createdAt),
-    updatedAt: String(row.updatedAt),
-  };
-}
-
-function loadRows(
+function loadRows<TRow extends SqliteRow>(
+  store: SqliteStoreDefinition<object, TRow>,
   db: SqliteDatabase,
-  rows: ReadonlyArray<RowRecord>,
+  rows: ReadonlyArray<TRow>,
 ) {
-  db.exec(`
-    create table "demo_rows" (
-      "id" text primary key,
-      "active" integer not null,
-      "symbol" text not null,
-      "company" text not null,
-      "sector" text not null,
-      "venue" text not null,
-      "price" real not null,
-      "volume" integer not null,
-      "created_at" text not null,
-      "updated_at" text not null
-    );
-  `);
+  db.exec(store.createTableSql);
 
   db.exec("begin");
   try {
-    const statement = db.prepare(`
-      insert into "demo_rows" (
-        "id",
-        "active",
-        "symbol",
-        "company",
-        "sector",
-        "venue",
-        "price",
-        "volume",
-        "created_at",
-        "updated_at"
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const statement = db.prepare(store.upsertSql);
 
     try {
       for (const row of rows) {
-        statement.bind([
-          row.id,
-          row.active ? 1 : 0,
-          row.symbol,
-          row.company,
-          row.sector,
-          row.venue,
-          row.price,
-          row.volume,
-          row.createdAt,
-          row.updatedAt,
-        ]);
+        statement.bind(store.encodeRow(row) as BindingSpec);
         statement.step();
         statement.reset();
       }
@@ -174,11 +117,12 @@ function loadRows(
     throw error;
   }
 
-  db.exec(`analyze "demo_rows"`);
+  db.exec(`analyze "${store.tableName.replaceAll(`"`, `""`)}"`);
 }
 
-function readRowCount(db: SqliteDatabase) {
-  return Number(db.selectValue(`select count(*) from "demo_rows"`) ?? 0);
+function readRowCount<TRow extends SqliteRow>(store: SqliteStoreDefinition<object, TRow>, db: SqliteDatabase) {
+  const tableSql = `"${store.tableName.replaceAll(`"`, `""`)}"`;
+  return Number(db.selectValue(`select count(*) from ${tableSql}`) ?? 0);
 }
 
 function selectValue(
@@ -201,18 +145,23 @@ function selectObjects(
     : db.selectObjects(sql, [...params] as BindingSpec);
 }
 
-export class StoreRegistry {
-  private readonly stores = new Map<string, StoreEntry>();
-  private readonly viewportSessions = new Map<string, ViewportSession>();
+export class StoreRegistry<TRow extends SqliteRow = SqliteRow> {
+  private readonly stores = new Map<string, StoreEntry<TRow>>();
+  private readonly viewportSessions = new Map<string, ViewportSession<TRow>>();
   private readonly writeRefreshThrottleMs: number;
   private readonly runtime: Runtime.Runtime<never>;
   private readonly createDatabase: SqliteDatabaseFactory;
+  private readonly store: SqliteStoreDefinition<object, TRow>;
 
-  constructor(options?: {
-    writeRefreshThrottleMs?: number;
-    runtime?: Runtime.Runtime<never>;
-    createDatabase?: SqliteDatabaseFactory;
-  }) {
+  constructor(
+    store: SqliteStoreDefinition<object, TRow>,
+    options?: {
+      writeRefreshThrottleMs?: number;
+      runtime?: Runtime.Runtime<never>;
+      createDatabase?: SqliteDatabaseFactory;
+    },
+  ) {
+    this.store = store;
     this.writeRefreshThrottleMs = options?.writeRefreshThrottleMs ?? DEFAULT_WRITE_REFRESH_THROTTLE_MS;
     this.runtime = options?.runtime ?? Runtime.defaultRuntime;
     this.createDatabase = options?.createDatabase ?? ((storeId, sqlite3) =>
@@ -221,7 +170,7 @@ export class StoreRegistry {
 
   async loadStore(
     definition: StoreDefinition,
-    source: StoreSource,
+    source: StoreSource<TRow>,
   ): Promise<LoadStoreSuccess> {
     if (this.stores.has(definition.storeId)) {
       throw new Error(`Store already exists: ${definition.storeId}`);
@@ -229,21 +178,16 @@ export class StoreRegistry {
 
     const rows = source.kind === "rows"
       ? [...source.rows]
-      : generateDemoRows(source.rowCount, source.seed ?? 1);
+      : this.loadGeneratedRows(source.rowCount, source.seed ?? 1);
 
     const sqlite3 = await getSqliteModule();
     const db = await this.createDatabase(definition.storeId, sqlite3);
-    loadRows(db, rows);
+    loadRows(this.store, db, rows);
 
-    const entry: StoreEntry = {
+    const entry: StoreEntry<TRow> = {
       storeId: definition.storeId,
-      rowKey: definition.rowKey,
       db,
-      makeStressRow: createDemoRowFactory(
-        (source.kind === "generator" ? source.seed ?? 1 : rows.length) + rows.length,
-        rows.length,
-        { realtimeTimestamps: true },
-      ),
+      makeStressRow: this.makeStressRowFactory(source, rows.length),
       rowCount: rows.length,
       rowsPerSecond: 0,
       metrics: {
@@ -320,7 +264,7 @@ export class StoreRegistry {
 
   async applyTransaction(
     storeId: string,
-    transaction: StoreTransaction,
+    transaction: StoreTransaction<TRow>,
   ): Promise<ApplyTransactionSuccess> {
     const entry = this.requireStore(storeId);
     const startedAt = await this.currentTimeMs();
@@ -328,45 +272,11 @@ export class StoreRegistry {
     if (transaction.kind === "upsert") {
       entry.db.exec("begin");
       try {
-        const statement = entry.db.prepare(`
-          insert into "demo_rows" (
-            "id",
-            "active",
-            "symbol",
-            "company",
-            "sector",
-            "venue",
-            "price",
-            "volume",
-            "created_at",
-            "updated_at"
-          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          on conflict ("id") do update set
-            "active" = excluded."active",
-            "symbol" = excluded."symbol",
-            "company" = excluded."company",
-            "sector" = excluded."sector",
-            "venue" = excluded."venue",
-            "price" = excluded."price",
-            "volume" = excluded."volume",
-            "created_at" = excluded."created_at",
-            "updated_at" = excluded."updated_at"
-        `);
+        const statement = entry.db.prepare(this.store.upsertSql);
 
         try {
           for (const row of transaction.rows) {
-            statement.bind([
-              row.id,
-              row.active ? 1 : 0,
-              row.symbol,
-              row.company,
-              row.sector,
-              row.venue,
-              row.price,
-              row.volume,
-              row.createdAt,
-              row.updatedAt,
-            ]);
+            statement.bind(this.store.encodeRow(row) as BindingSpec);
             statement.step();
             statement.reset();
           }
@@ -381,12 +291,12 @@ export class StoreRegistry {
       }
     } else if (transaction.ids.length > 0) {
       entry.db.exec({
-        sql: `delete from "demo_rows" where "id" in (${createPlaceholders(transaction.ids.length)})`,
+        sql: this.store.deleteSql(transaction.ids.length),
         bind: [...transaction.ids],
       });
     }
 
-    entry.rowCount = readRowCount(entry.db);
+    entry.rowCount = readRowCount(this.store, entry.db);
     const completedAt = await this.currentTimeMs();
     entry.metrics = {
       lastCommitDurationMs: completedAt - startedAt,
@@ -460,9 +370,13 @@ export class StoreRegistry {
     };
   }
 
-  private makeStressBatch(entry: StoreEntry) {
+  private makeStressBatch(entry: StoreEntry<TRow>) {
     const batchSize = this.getStressBatchSize(entry.rowsPerSecond);
-    return Array.from({ length: batchSize }, () => entry.makeStressRow());
+    if (entry.makeStressRow === null) {
+      throw new Error("Stress updates are not configured for this store");
+    }
+
+    return Array.from({ length: batchSize }, () => entry.makeStressRow!()) as Array<TRow>;
   }
 
   private getStressBatchSize(rowsPerSecond: number) {
@@ -474,7 +388,7 @@ export class StoreRegistry {
     return Math.max(16, Math.round((1000 * batchSize) / Math.max(rowsPerSecond, 1)));
   }
 
-  private stopStress(entry: StoreEntry) {
+  private stopStress(entry: StoreEntry<TRow>) {
     if (entry.stressFiber === null) {
       return;
     }
@@ -489,8 +403,8 @@ export class StoreRegistry {
     }
     this.requireStore(request.storeId);
 
-    const queue = await this.runPromise(Queue.unbounded<ViewportPatch>());
-    const session: ViewportSession = {
+    const queue = await this.runPromise(Queue.unbounded<ViewportPatch<TRow>>());
+    const session: ViewportSession<TRow> = {
       sessionId: request.sessionId,
       storeId: request.storeId,
       queue,
@@ -522,7 +436,7 @@ export class StoreRegistry {
     }
   }
 
-  private async flushViewportRefresh(session: ViewportSession) {
+  private async flushViewportRefresh(session: ViewportSession<TRow>) {
     if (session.closed) {
       return;
     }
@@ -543,16 +457,17 @@ export class StoreRegistry {
     }
   }
 
-  private async runViewportQuery(session: ViewportSession, triggeredAtMs: number | null) {
+  private async runViewportQuery(session: ViewportSession<TRow>, triggeredAtMs: number | null) {
     const entry = this.requireStore(session.storeId);
     const runId = ++session.runId;
     const request = session.request;
     session.inFlightCount += 1;
 
     try {
-      const plan = planViewportQuery(request.query, request);
+      const plan = planViewportQuery(this.store, request.query, request);
       const rowCount = Number(selectValue(entry.db, plan.countSql, plan.countParams) ?? 0);
-      const rows = selectObjects(entry.db, plan.rowsSql, plan.rowsParams).map(normalizeRow);
+      const rows = selectObjects(entry.db, plan.rowsSql, plan.rowsParams)
+        .map((row) => this.store.decodeRow(row as Record<string, unknown>));
 
       if (session.closed || runId !== session.runId || !session.queue.isActive()) {
         return;
@@ -591,7 +506,7 @@ export class StoreRegistry {
     return session;
   }
 
-  private scheduleViewportRefresh(session: ViewportSession) {
+  private scheduleViewportRefresh(session: ViewportSession<TRow>) {
     if (session.closed || session.throttledRefreshFiber !== null) {
       return;
     }
@@ -622,5 +537,26 @@ export class StoreRegistry {
 
   private runPromise<A, E>(effect: Effect.Effect<A, E, never>) {
     return Runtime.runPromise(this.runtime)(effect);
+  }
+
+  private loadGeneratedRows(rowCount: number, seed: number) {
+    const generateRows = this.store.rowFactory?.generateRows;
+    if (!generateRows) {
+      throw new Error("This store does not support generator bootstrap");
+    }
+
+    return [...generateRows(rowCount, seed)];
+  }
+
+  private makeStressRowFactory(source: StoreSource<TRow>, rowCount: number) {
+    const createStressRowFactory = this.store.rowFactory?.createStressRowFactory;
+    if (!createStressRowFactory) {
+      return null;
+    }
+
+    const seed = source.kind === "generator" ? source.seed ?? 1 : rowCount;
+    return createStressRowFactory(seed + rowCount, rowCount, {
+      realtimeTimestamps: true,
+    });
   }
 }

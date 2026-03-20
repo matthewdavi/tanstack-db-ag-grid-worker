@@ -6,14 +6,60 @@ import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/TestClock";
+import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { effect, expect } from "@effect/vitest";
 
-import type { RowRecord } from "./row-schema";
+import { defineSqliteStore } from "./store-config";
 import { StoreRegistry } from "./store-registry";
 
-const STOCK_ROWS: ReadonlyArray<RowRecord> = [
+const stocksTable = sqliteTable("inventory_items", {
+  sku: text("sku").primaryKey(),
+  active: integer("is_active", { mode: "boolean" }).notNull(),
+  symbol: text("symbol_code").notNull(),
+  company: text("company_name").notNull(),
+  sector: text("sector_name").notNull(),
+  venue: text("venue_code").notNull(),
+  price: real("last_price").notNull(),
+  volume: integer("share_volume").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+type StockRow = typeof stocksTable.$inferSelect;
+
+const stockStore = defineSqliteStore({
+  table: stocksTable,
+  rowKey: "sku",
+  rowFactory: {
+    createStressRowFactory(seed, startIndex, options) {
+      let index = startIndex;
+      return () => {
+        const nextIndex = index;
+        index += 1;
+        const timestamp = options?.realtimeTimestamps
+          ? new Date(Date.UTC(2026, 2, 20, 12, 0, 0, nextIndex)).toISOString()
+          : "2026-01-01T00:00:00.000Z";
+
+        return {
+          sku: `stress-${seed}-${nextIndex}`,
+          active: true,
+          symbol: `SYM${nextIndex}`,
+          company: `Stress ${nextIndex}`,
+          sector: "Technology",
+          venue: "NASDAQ",
+          price: 100 + nextIndex,
+          volume: 1000 + nextIndex,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+      };
+    },
+  },
+});
+
+const STOCK_ROWS: ReadonlyArray<StockRow> = [
   {
-    id: "1",
+    sku: "1",
     active: true,
     symbol: "ZETA",
     company: "Zeta Corp",
@@ -25,7 +71,7 @@ const STOCK_ROWS: ReadonlyArray<RowRecord> = [
     updatedAt: "2026-01-01T00:00:00.000Z",
   },
   {
-    id: "2",
+    sku: "2",
     active: true,
     symbol: "ALFA",
     company: "Alfa Corp",
@@ -37,7 +83,7 @@ const STOCK_ROWS: ReadonlyArray<RowRecord> = [
     updatedAt: "2026-01-01T00:00:00.000Z",
   },
   {
-    id: "3",
+    sku: "3",
     active: true,
     symbol: "BRAV",
     company: "Bravo Corp",
@@ -50,12 +96,11 @@ const STOCK_ROWS: ReadonlyArray<RowRecord> = [
   },
 ];
 
-function loadStocks(registry: StoreRegistry) {
+function loadStocks(registry: StoreRegistry<StockRow>) {
   return Effect.promise(() =>
     registry.loadStore(
       {
         storeId: "stocks",
-        rowKey: "id",
       },
       {
         kind: "rows",
@@ -66,11 +111,11 @@ function loadStocks(registry: StoreRegistry) {
 }
 
 function withPatches<T>(
-  registry: StoreRegistry,
-  execute: (patches: Queue.Queue<any>) => Effect.Effect<T, string, never>,
+  registry: StoreRegistry<StockRow>,
+  execute: (patches: Queue.Queue<{ rows: ReadonlyArray<StockRow>; rowCount: number; latencyMs: number }>) => Effect.Effect<T, string, never>,
 ) {
   return Effect.scoped(Effect.gen(function* () {
-    const patches = yield* Queue.unbounded<any>();
+    const patches = yield* Queue.unbounded<{ rows: ReadonlyArray<StockRow>; rowCount: number; latencyMs: number }>();
     yield* Stream.runForEachScoped(
       registry.openViewportSession({
         sessionId: "session-1",
@@ -92,19 +137,19 @@ function withPatches<T>(
 describe("sqlite store registry", () => {
   effect("opens a viewport session and returns the initial sorted slice", () =>
     Effect.gen(function* () {
-      const registry = new StoreRegistry();
+      const registry = new StoreRegistry(stockStore);
       yield* loadStocks(registry);
 
       const patch = yield* withPatches(registry, (patches) => Queue.take(patches));
 
-      expect(patch.rows.map((row: RowRecord) => row.symbol)).toEqual(["ALFA", "BRAV"]);
+      expect(patch.rows.map((row: StockRow) => row.symbol)).toEqual(["ALFA", "BRAV"]);
       expect(patch.rowCount).toBe(3);
       expect(patch.latencyMs).toBe(0);
     }));
 
   effect("reruns the visible window immediately when the range changes", () =>
     Effect.gen(function* () {
-      const registry = new StoreRegistry();
+      const registry = new StoreRegistry(stockStore);
       yield* loadStocks(registry);
 
       const result = yield* withPatches(registry, (patches) =>
@@ -122,8 +167,8 @@ describe("sqlite store registry", () => {
           const shifted = yield* Queue.take(patches);
 
           return {
-            initial: initial.rows.map((row: RowRecord) => row.symbol),
-            shifted: shifted.rows.map((row: RowRecord) => row.symbol),
+            initial: initial.rows.map((row: StockRow) => row.symbol),
+            shifted: shifted.rows.map((row: StockRow) => row.symbol),
           };
         }));
 
@@ -133,7 +178,7 @@ describe("sqlite store registry", () => {
 
   effect("reruns the query immediately when sort or filter changes", () =>
     Effect.gen(function* () {
-      const registry = new StoreRegistry();
+      const registry = new StoreRegistry(stockStore);
       yield* loadStocks(registry);
 
       const result = yield* withPatches(registry, (patches) =>
@@ -157,16 +202,37 @@ describe("sqlite store registry", () => {
           });
 
           const filtered = yield* Queue.take(patches);
-          return filtered.rows.map((row: RowRecord) => row.symbol);
+          return filtered.rows.map((row: StockRow) => row.symbol);
         }));
 
       expect(result).toEqual(["ZETA", "BRAV"]);
     }));
 
+  effect("deletes rows using the configured row key", () =>
+    Effect.gen(function* () {
+      const registry = new StoreRegistry(stockStore);
+      yield* loadStocks(registry);
+
+      const result = yield* withPatches(registry, (patches) =>
+        Effect.gen(function* () {
+          yield* Queue.take(patches);
+          yield* Effect.promise(() =>
+            registry.applyTransaction("stocks", {
+              kind: "delete",
+              ids: ["2"],
+            }),
+          );
+          const patch = yield* Queue.take(patches);
+          return patch.rows.map((row) => row.symbol);
+        }));
+
+      expect(result).toEqual(["BRAV", "ZETA"]);
+    }));
+
   effect("coalesces write-driven refreshes to one patch per 100ms window", () =>
     Effect.gen(function* () {
       const runtime = yield* Effect.runtime<never>();
-      const registry = new StoreRegistry({ runtime });
+      const registry = new StoreRegistry(stockStore, { runtime });
       yield* loadStocks(registry);
 
       const seen = yield* Effect.scoped(Effect.gen(function* () {
@@ -193,7 +259,7 @@ describe("sqlite store registry", () => {
             kind: "upsert",
             rows: [
               {
-                id: "4",
+                sku: "4",
                 active: true,
                 symbol: "CHAR",
                 company: "Charlie Corp",
@@ -212,7 +278,7 @@ describe("sqlite store registry", () => {
             kind: "upsert",
             rows: [
               {
-                id: "5",
+                sku: "5",
                 active: true,
                 symbol: "DELT",
                 company: "Delta Corp",
@@ -240,7 +306,7 @@ describe("sqlite store registry", () => {
   effect("reports write refresh latency from query execution, not throttle delay", () =>
     Effect.gen(function* () {
       const runtime = yield* Effect.runtime<never>();
-      const registry = new StoreRegistry({ runtime });
+      const registry = new StoreRegistry(stockStore, { runtime });
       yield* loadStocks(registry);
 
       const patch = yield* Effect.scoped(Effect.gen(function* () {
@@ -265,7 +331,7 @@ describe("sqlite store registry", () => {
             kind: "upsert",
             rows: [
               {
-                id: "4",
+                sku: "4",
                 active: true,
                 symbol: "CHAR",
                 company: "Charlie Corp",
@@ -288,13 +354,12 @@ describe("sqlite store registry", () => {
     }));
 
   it("keeps generating fresh stress batches on each tick", async () => {
-    const registry = new StoreRegistry({
+    const registry = new StoreRegistry(stockStore, {
       writeRefreshThrottleMs: 0,
     });
     await registry.loadStore(
       {
         storeId: "stocks",
-        rowKey: "id",
       },
       {
         kind: "rows",

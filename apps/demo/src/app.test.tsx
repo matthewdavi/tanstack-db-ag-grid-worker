@@ -19,8 +19,9 @@ import type {
 } from "@sandbox/sqlite-store";
 
 import { App } from "./app";
+import type { MarketRow } from "./market-sqlite-store";
 
-const sampleRows = [
+const sampleRows: ReadonlyArray<MarketRow> = [
   {
     id: "1",
     active: true,
@@ -173,8 +174,8 @@ function makeClient(): WorkerClient {
   };
 }
 
-function makeSqliteClient(): SqliteWorkerClient {
-  const updates = Stream.fromIterable<SqliteViewportPatch>([{
+function makeSqliteClient(): SqliteWorkerClient<MarketRow> {
+  const updates = Stream.fromIterable<SqliteViewportPatch<MarketRow>>([{
     storeId: "sqlite-olympic-athletes",
     startRow: 0,
     endRow: sampleRows.length,
@@ -225,7 +226,7 @@ function makeSqliteClient(): SqliteWorkerClient {
   };
 }
 
-function makePendingSqliteClient(): SqliteWorkerClient {
+function makePendingSqliteClient(): SqliteWorkerClient<MarketRow> {
   return {
     loadStore: vi.fn().mockImplementation(() => new Promise(() => undefined)),
     collection: vi.fn().mockReturnValue({

@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@faker-js/faker": "^9.9.0",
     "@sandbox/ag-grid-translator": "workspace:*",
     "@sandbox/sqlite-store": "workspace:*",
     "@sandbox/worker-store": "workspace:*",
@@ -17,6 +18,7 @@
     "ag-grid-community": "^35.1.0",
     "ag-grid-enterprise": "^35.1.0",
     "ag-grid-react": "^35.1.0",
+    "drizzle-orm": "^0.44.5",
     "effect": "^3.19.19",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

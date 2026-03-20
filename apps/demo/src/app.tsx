@@ -31,10 +31,10 @@ import { translateAgGridQuery } from "@sandbox/ag-grid-translator";
 import {
   createSqliteViewportDatasource,
   createSqliteWorkerClient,
-  type RowRecord as MarketRow,
   type SqliteCollectionHandle,
   type SqliteWorkerClient,
 } from "@sandbox/sqlite-store";
+import type { MarketRow } from "./market-sqlite-store";
 
 const licenseKey = import.meta.env.VITE_AG_GRID_LICENSE_KEY;
 if (typeof licenseKey === "string" && licenseKey.length > 0) {
@@ -254,7 +254,7 @@ function makeBrowserWorkerClient() {
 }
 
 function makeBrowserSqliteWorkerClient() {
-  return createSqliteWorkerClient(
+  return createSqliteWorkerClient<MarketRow>(
     () =>
       new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
         type: "module",
@@ -711,7 +711,7 @@ function ViewportGridPanel(props: ViewportGridPanelProps) {
 
 export interface AppProps {
   client?: WorkerClient;
-  sqliteClient?: SqliteWorkerClient;
+  sqliteClient?: SqliteWorkerClient<MarketRow>;
 }
 
 export function App(props: AppProps) {
@@ -726,7 +726,9 @@ export function App(props: AppProps) {
     SQLITE_STORE_ID,
   );
   const collection = client ? client.collection(STORE_ID) : null;
-  const sqliteCollection = sqliteClient ? sqliteClient.collection(SQLITE_STORE_ID) : null;
+  const sqliteCollection = sqliteClient
+    ? sqliteClient.collection(SQLITE_STORE_ID)
+    : null;
   const tanstackReady = ready && collection !== null;
   const sqliteStoreReady = sqliteReady && sqliteCollection !== null;
 

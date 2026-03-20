@@ -17,7 +17,7 @@ import type {
 
 import { translateAgGridQuery } from "@sandbox/ag-grid-translator";
 
-import type { RowRecord } from "./row-schema";
+import type { SqliteRow } from "./store-config";
 import type { StoreMetrics } from "./worker-contract";
 import type {
   SqliteCollectionHandle,
@@ -102,14 +102,14 @@ function columnStateToSortModel(
     }));
 }
 
-function toViewportRows(
+function toViewportRows<TRow extends SqliteRow>(
   startRow: number,
-  rows: ReadonlyArray<RowRecord>,
-): Record<number, RowRecord> {
+  rows: ReadonlyArray<TRow>,
+): Record<number, TRow> {
   return Object.fromEntries(rows.map((row, index) => [startRow + index, row]));
 }
 
-function readQuery<TData extends RowRecord>(
+function readQuery<TData extends SqliteRow>(
   params: IViewportDatasourceParams<TData>,
 ) {
   return translateAgGridQuery({
@@ -128,8 +128,8 @@ export interface ViewportDatasourceHandle extends IViewportDatasource {
   }): void;
 }
 
-export function createSqliteViewportDatasource<TData extends RowRecord = RowRecord>(
-  collection: Pick<SqliteCollectionHandle, "openViewportSession">,
+export function createSqliteViewportDatasource<TData extends SqliteRow = SqliteRow>(
+  collection: Pick<SqliteCollectionHandle<TData>, "openViewportSession">,
   options: GridStoreAdapterOptions,
 ): ViewportDatasourceHandle {
   let params: IViewportDatasourceParams<TData> | null = null;
@@ -206,7 +206,7 @@ export function createSqliteViewportDatasource<TData extends RowRecord = RowReco
       rowCount: number;
       latencyMs: number;
       metrics: StoreMetrics;
-      rows: ReadonlyArray<RowRecord>;
+      rows: ReadonlyArray<TData>;
     },
   ) => {
     patchCount += 1;
@@ -223,7 +223,7 @@ export function createSqliteViewportDatasource<TData extends RowRecord = RowReco
       endRow: patch.endRow,
     });
     currentParams.setRowCount(patch.rowCount, true);
-    currentParams.setRowData(toViewportRows(patch.startRow, patch.rows) as Record<number, TData>);
+    currentParams.setRowData(toViewportRows(patch.startRow, patch.rows));
   };
 
   const startViewportSession = (currentParams: IViewportDatasourceParams<TData>) => {

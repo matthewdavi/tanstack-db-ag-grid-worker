@@ -32,9 +32,9 @@ import {
   SetStressRate,
 } from "./worker-contract";
 
-import type { RowRecord } from "./row-schema";
+import type { SqliteRow } from "./store-config";
 
-export interface SqliteViewportSessionHandle<TRow extends RowRecord = RowRecord> {
+export interface SqliteViewportSessionHandle<TRow extends SqliteRow = SqliteRow> {
   readonly sessionId: string;
   readonly updates: Stream.Stream<
     ViewportPatch<TRow>,
@@ -46,7 +46,7 @@ export interface SqliteViewportSessionHandle<TRow extends RowRecord = RowRecord>
   close(): Promise<CloseViewportSessionSuccess>;
 }
 
-export interface SqliteCollectionHandle<TRow extends RowRecord = RowRecord> {
+export interface SqliteCollectionHandle<TRow extends SqliteRow = SqliteRow> {
   readonly storeId: string;
   applyTransaction(
     transaction: StoreTransaction<TRow>,
@@ -60,7 +60,7 @@ export interface SqliteCollectionHandle<TRow extends RowRecord = RowRecord> {
   dispose(): Promise<DisposeStoreSuccess>;
 }
 
-export interface SqliteWorkerClient<TRow extends RowRecord = RowRecord> {
+export interface SqliteWorkerClient<TRow extends SqliteRow = SqliteRow> {
   loadStore(
     definition: StoreDefinition,
     source: StoreSource<TRow>,
@@ -77,9 +77,9 @@ function createSessionId() {
   return `sqlite-viewport-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export async function createSqliteWorkerClient(
+export async function createSqliteWorkerClient<TRow extends SqliteRow = SqliteRow>(
   spawn: (id: number) => globalThis.Worker | globalThis.SharedWorker | MessagePort,
-): Promise<SqliteWorkerClient> {
+): Promise<SqliteWorkerClient<TRow>> {
   const scope = await Effect.runPromise(Scope.make());
   const worker = await Effect.runPromise(
     Scope.extend(
@@ -128,7 +128,7 @@ export async function createSqliteWorkerClient(
                 worker.executeEffect(new CloseViewportSession({ sessionId })),
               );
             },
-          };
+          } as SqliteViewportSessionHandle<TRow>;
         },
         setStressRate(rowsPerSecond) {
           return Effect.runPromise(worker.executeEffect(new SetStressRate({ storeId, rowsPerSecond })));
@@ -136,7 +136,7 @@ export async function createSqliteWorkerClient(
         dispose() {
           return Effect.runPromise(worker.executeEffect(new DisposeStore({ storeId })));
         },
-      };
+      } as SqliteCollectionHandle<TRow>;
     },
     close() {
       return Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));

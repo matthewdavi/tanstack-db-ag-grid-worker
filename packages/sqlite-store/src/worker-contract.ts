@@ -3,20 +3,10 @@ import { Schema } from "effect";
 import { GridQueryStateSchema } from "@sandbox/ag-grid-translator";
 
 import type { GridQueryState } from "@sandbox/ag-grid-translator";
-import type { RowRecord } from "./row-schema";
+import type { SqliteRow } from "./store-config";
 
-const RowRecordSchema = Schema.Struct({
-  id: Schema.String,
-  active: Schema.Boolean,
-  symbol: Schema.String,
-  company: Schema.String,
-  sector: Schema.String,
-  venue: Schema.String,
-  price: Schema.Number,
-  volume: Schema.Number,
-  createdAt: Schema.String,
-  updatedAt: Schema.String,
-}) as Schema.Schema<RowRecord>;
+const RowPayloadSchema = Schema.Unknown;
+const RowKeyValueSchema = Schema.Union(Schema.String, Schema.Number);
 
 const StoreMetricsSchema = Schema.Struct({
   lastCommitDurationMs: Schema.NullOr(Schema.Number),
@@ -26,20 +16,20 @@ const StoreMetricsSchema = Schema.Struct({
 
 export const StoreDefinitionSchema = Schema.Struct({
   storeId: Schema.String,
-  rowKey: Schema.String,
+  rowKey: Schema.optionalWith(Schema.String, { nullable: true }),
 }) as Schema.Schema<StoreDefinition>;
 
 export const StoreSourceSchema = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal("rows"),
-    rows: Schema.Array(RowRecordSchema),
+    rows: Schema.Array(RowPayloadSchema),
   }),
   Schema.Struct({
     kind: Schema.Literal("generator"),
     rowCount: Schema.Number,
     seed: Schema.optionalWith(Schema.Number, { nullable: true }),
   }),
-) as Schema.Schema<StoreSource<RowRecord>>;
+) as Schema.Schema<StoreSource>;
 
 export const OpenViewportSessionRequestSchema = Schema.Struct({
   sessionId: Schema.String,
@@ -67,8 +57,8 @@ export const ViewportPatchSchema = Schema.Struct({
   rowCount: Schema.Number,
   latencyMs: Schema.Number,
   metrics: StoreMetricsSchema,
-  rows: Schema.Array(RowRecordSchema),
-}) as Schema.Schema<ViewportPatch<RowRecord>>;
+  rows: Schema.Array(RowPayloadSchema),
+}) as Schema.Schema<ViewportPatch>;
 
 const LoadStoreSuccessSchema = Schema.Struct({
   storeId: Schema.String,
@@ -108,13 +98,13 @@ const StressStateSchema = Schema.Struct({
 const TransactionSchema = Schema.Union(
   Schema.Struct({
     kind: Schema.Literal("upsert"),
-    rows: Schema.Array(RowRecordSchema),
+    rows: Schema.Array(RowPayloadSchema),
   }),
   Schema.Struct({
     kind: Schema.Literal("delete"),
-    ids: Schema.Array(Schema.String),
+    ids: Schema.Array(RowKeyValueSchema),
   }),
-) as Schema.Schema<StoreTransaction<RowRecord>>;
+) as Schema.Schema<StoreTransaction>;
 
 export class LoadStore extends Schema.TaggedRequest<LoadStore>("LoadStore")("LoadStore", {
   failure: Schema.String,
@@ -196,10 +186,10 @@ export type WorkerRequest = typeof WorkerRequestSchema.Type;
 
 export interface StoreDefinition {
   storeId: string;
-  rowKey: string;
+  rowKey?: string | null;
 }
 
-export type StoreSource<TRow extends RowRecord = RowRecord> =
+export type StoreSource<TRow extends SqliteRow = SqliteRow> =
   | {
       kind: "rows";
       rows: ReadonlyArray<TRow>;
@@ -229,7 +219,7 @@ export interface CloseViewportSessionRequest {
   sessionId: string;
 }
 
-export interface ViewportPatch<TRow extends RowRecord = RowRecord> {
+export interface ViewportPatch<TRow extends SqliteRow = SqliteRow> {
   storeId: string;
   startRow: number;
   endRow: number;
@@ -239,14 +229,14 @@ export interface ViewportPatch<TRow extends RowRecord = RowRecord> {
   rows: ReadonlyArray<TRow>;
 }
 
-export type StoreTransaction<TRow extends RowRecord = RowRecord> =
+export type StoreTransaction<TRow extends SqliteRow = SqliteRow> =
   | {
       kind: "upsert";
       rows: ReadonlyArray<TRow>;
     }
   | {
       kind: "delete";
-      ids: ReadonlyArray<string>;
+      ids: ReadonlyArray<string | number>;
     };
 
 export interface LoadStoreSuccess {

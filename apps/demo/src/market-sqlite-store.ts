@@ -1,6 +1,7 @@
 import { Faker, en } from "@faker-js/faker";
+import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
-import type { RowRecord } from "./row-schema";
+import { defineSqliteStore } from "@sandbox/sqlite-store";
 
 const SECTORS = [
   "Technology",
@@ -10,6 +11,21 @@ const SECTORS = [
   "Industrials",
 ] as const;
 const VENUES = ["NASDAQ", "NYSE", "CBOE", "IEX"] as const;
+
+export const marketRowsTable = sqliteTable("demo_rows", {
+  id: text("id").primaryKey(),
+  active: integer("active", { mode: "boolean" }).notNull(),
+  symbol: text("symbol").notNull(),
+  company: text("company").notNull(),
+  sector: text("sector").notNull(),
+  venue: text("venue").notNull(),
+  price: real("price").notNull(),
+  volume: integer("volume").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export type MarketRow = typeof marketRowsTable.$inferSelect;
 
 interface DemoRowFactoryOptions {
   realtimeTimestamps?: boolean;
@@ -23,7 +39,7 @@ function createFaker(seed: number) {
   return faker;
 }
 
-export function createDemoRowFactory(
+export function createMarketRowFactory(
   seed = 1,
   startIndex = 0,
   options: DemoRowFactoryOptions = {},
@@ -31,7 +47,7 @@ export function createDemoRowFactory(
   const faker = createFaker(seed);
   let index = startIndex;
 
-  return (): RowRecord => {
+  return (): MarketRow => {
     const nextIndex = index;
     index += 1;
 
@@ -75,7 +91,16 @@ export function createDemoRowFactory(
   };
 }
 
-export function generateDemoRows(rowCount: number, seed = 1): ReadonlyArray<RowRecord> {
-  const makeRow = createDemoRowFactory(seed);
+export function generateMarketRows(rowCount: number, seed = 1): ReadonlyArray<MarketRow> {
+  const makeRow = createMarketRowFactory(seed);
   return Array.from({ length: rowCount }, () => makeRow());
 }
+
+export const marketSqliteStore = defineSqliteStore({
+  table: marketRowsTable,
+  rowKey: "id",
+  rowFactory: {
+    generateRows: generateMarketRows,
+    createStressRowFactory: createMarketRowFactory,
+  },
+});

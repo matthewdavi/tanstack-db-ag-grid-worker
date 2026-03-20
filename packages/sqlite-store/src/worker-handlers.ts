@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner";
 import * as WorkerRunner from "@effect/platform/WorkerRunner";
 
+import type { SqliteRow, SqliteStoreDefinition } from "./store-config";
 import { StoreRegistry } from "./store-registry";
 import {
   ApplyTransaction,
@@ -16,16 +17,31 @@ import {
   WorkerRequestSchema,
 } from "./worker-contract";
 
-export function createSqliteWorkerHandlers(registry = new StoreRegistry()) {
+export function createSqliteWorkerHandlers<TRow extends SqliteRow = SqliteRow>(
+  store: SqliteStoreDefinition<object, TRow>,
+  registry = new StoreRegistry(store),
+) {
+  const loadStore = (request: LoadStore) =>
+    registry.loadStore(
+      request.definition,
+      request.source as Parameters<typeof registry.loadStore>[1],
+    );
+
+  const applyTransaction = (request: ApplyTransaction) =>
+    registry.applyTransaction(
+      request.storeId,
+      request.transaction as Parameters<typeof registry.applyTransaction>[1],
+    );
+
   const handlers = {
     LoadStore: (request: LoadStore) =>
       Effect.tryPromise({
-        try: () => registry.loadStore(request.definition, request.source),
+        try: () => loadStore(request),
         catch: (error) => error instanceof Error ? error.message : "Failed to load store",
       }),
     ApplyTransaction: (request: ApplyTransaction) =>
       Effect.tryPromise({
-        try: () => registry.applyTransaction(request.storeId, request.transaction),
+        try: () => applyTransaction(request),
         catch: (error) => error instanceof Error ? error.message : "Failed to apply transaction",
       }),
     OpenViewportSession: (request: OpenViewportSession) =>
@@ -46,15 +62,21 @@ export function createSqliteWorkerHandlers(registry = new StoreRegistry()) {
   return handlers;
 }
 
-export function makeSqliteWorkerLayer(registry = new StoreRegistry()) {
+export function makeSqliteWorkerLayer<TRow extends SqliteRow = SqliteRow>(
+  store: SqliteStoreDefinition<object, TRow>,
+  registry = new StoreRegistry(store),
+) {
   return WorkerRunner.layerSerialized(
     WorkerRequestSchema,
-    createSqliteWorkerHandlers(registry),
+    createSqliteWorkerHandlers(store, registry),
   );
 }
 
-export function launchSqliteBrowserWorker(registry = new StoreRegistry()) {
-  return BrowserWorkerRunner.launch(makeSqliteWorkerLayer(registry)).pipe(
+export function launchSqliteBrowserWorker<TRow extends SqliteRow = SqliteRow>(
+  store: SqliteStoreDefinition<object, TRow>,
+  registry = new StoreRegistry(store),
+) {
+  return BrowserWorkerRunner.launch(makeSqliteWorkerLayer(store, registry)).pipe(
     Effect.provide(BrowserWorkerRunner.layer),
   );
 }
