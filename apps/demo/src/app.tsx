@@ -52,18 +52,17 @@ export function App(props: AppProps) {
               "mb-2 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500"
             }
           >
-            {"sqlite worker · ag grid"}
           </p>
           <h1
             className={
               "m-0 mb-3 text-3xl font-semibold tracking-tight text-zinc-50 sm:text-4xl"
             }
           >
-            {"the fastest grid you've ever seen in your life"}
+            {"this is the fastest grid you've ever seen in your life"}
           </h1>
           <p className={"m-0 max-w-[52ch] text-sm leading-relaxed text-zinc-400"}>
             {
-              "~2.5k rows/sec in the worker, main thread stays smooth. you have to be a fool to bet against sqlite"
+              "25k rows/sec in the worker, main thread stays smooth. you have to be a fool to bet against sqlite"
             }
           </p>
         </div>

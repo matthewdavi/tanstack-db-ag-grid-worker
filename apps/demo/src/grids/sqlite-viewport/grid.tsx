@@ -50,7 +50,7 @@ export function SqliteViewportGrid(props: SqliteViewportGridProps) {
           <span className={"text-zinc-400"}>{"Rows per second"}</span>
           <input
             aria-label={"Rows per second"}
-            max={2500}
+            max={25000}
             min={0}
             onInput={(event) => {
               controller.onStressRateInput(event.currentTarget.value);
