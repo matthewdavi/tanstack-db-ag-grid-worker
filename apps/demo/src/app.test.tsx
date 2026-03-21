@@ -1,7 +1,5 @@
 // @vitest-environment jsdom
 
-import "ag-grid-community/styles/ag-grid.css";
-import "ag-grid-community/styles/ag-theme-quartz.css";
 import "ag-grid-enterprise";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -229,19 +227,21 @@ function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
 }
 
 describe("demo app", () => {
-  it("mounts both worker-backed grid modes and wires the demo panels", async () => {
+  it("mounts both viewport grids and wires the demo panels", async () => {
     const client = makeClient();
     const sqliteClient = makeSqliteClient();
     render(<App client={client} sqliteClient={sqliteClient} />);
 
-    await screen.findByText("Server-Side Pull");
-    const viewportHeading = await screen.findByRole("heading", { name: "Viewport Push" });
     const sqliteHeading = await screen.findByRole("heading", { name: "SQLite SQL Viewport" });
+    const viewportHeading = await screen.findByRole("heading", { name: "Viewport Push" });
     const viewportPanel = viewportHeading.closest("section");
     const sqlitePanel = sqliteHeading.closest("section");
 
     expect(viewportPanel).not.toBeNull();
     expect(sqlitePanel).not.toBeNull();
+    expect(
+      sqliteHeading.compareDocumentPosition(viewportHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeGreaterThan(0);
 
     await screen.findAllByText("Ada Insights Holdings");
 

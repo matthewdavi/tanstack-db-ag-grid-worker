@@ -1,0 +1,98 @@
+.grid-shell .ag-root-wrapper {
+  overflow: hidden;
+  border-radius: 0.75rem;
+  border: 1px solid rgb(39 39 42 / 0.9);
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.04);
+}
+
+.grid-shell--viewport .ag-overlay-loading-wrapper {
+  background: linear-gradient(
+    135deg,
+    rgb(9 9 11 / 0.92),
+    rgb(24 24 27 / 0.88)
+  );
+  backdrop-filter: blur(10px);
+}
+
+.grid-shell--viewport .ag-overlay-loading-center {
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
+
+.viewport-loading-overlay {
+  display: inline-flex;
+  min-width: 19rem;
+  align-items: center;
+  gap: 0.75rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgb(63 63 70 / 0.8);
+  padding: 0.875rem 1rem;
+  color: #fafafa;
+  background: linear-gradient(
+    145deg,
+    rgb(39 39 42 / 0.95),
+    rgb(24 24 27 / 0.98)
+  );
+  box-shadow:
+    0 20px 40px rgb(0 0 0 / 0.45),
+    inset 0 1px 0 rgb(255 255 255 / 0.06);
+}
+
+.viewport-loading-overlay__pulse {
+  height: 0.75rem;
+  width: 0.75rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: radial-gradient(
+    circle at 35% 35%,
+    rgb(196 181 253 / 0.9) 0%,
+    rgb(99 102 241 / 0.95) 45%,
+    rgb(67 56 202) 100%
+  );
+  box-shadow:
+    0 0 0 0 rgb(99 102 241 / 0.35),
+    0 0 0.75rem rgb(99 102 241 / 0.45);
+  animation: viewport-loading-pulse 1.2s ease-out infinite;
+}
+
+.viewport-loading-overlay__copy {
+  display: grid;
+  gap: 0.15rem;
+  text-align: left;
+}
+
+.viewport-loading-overlay__copy strong {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.viewport-loading-overlay__copy span {
+  font-size: 0.8125rem;
+  color: rgb(161 161 170);
+}
+
+@keyframes viewport-loading-pulse {
+  0% {
+    transform: scale(0.96);
+    box-shadow:
+      0 0 0 0 rgb(99 102 241 / 0.4),
+      0 0 0.75rem rgb(99 102 241 / 0.45);
+  }
+
+  70% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 0.65rem rgb(99 102 241 / 0),
+      0 0 1rem rgb(99 102 241 / 0.25);
+  }
+
+  100% {
+    transform: scale(0.96);
+    box-shadow:
+      0 0 0 0 rgb(99 102 241 / 0),
+      0 0 0.65rem rgb(99 102 241 / 0.2);
+  }
+}

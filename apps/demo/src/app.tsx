@@ -1,40 +1,18 @@
-import "ag-grid-community/styles/ag-grid.css";
-import "ag-grid-community/styles/ag-theme-quartz.css";
-
-import { startTransition, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
-
-import type {
-  ColDef,
-  FilterChangedEvent,
-  GridApi,
-  GridReadyEvent,
-  GetRowIdParams,
-  IViewportDatasource,
-  StatusBar,
-} from "ag-grid-community";
+import { useSelector } from "@xstate/store-react";
 import { ModuleRegistry as AgGridModuleRegistry } from "ag-grid-community";
-import { AgGridReact } from "ag-grid-react";
 import {
   AllEnterpriseModule,
   LicenseManager,
 } from "ag-grid-enterprise";
 
-import {
-  createServerSideDatasource,
-  createViewportDatasource,
-  createWorkerClient,
-  type WorkerClient,
-  type WorkerCollectionHandle,
-} from "@sandbox/worker-store";
-import type { AgGridSqliteClient } from "@sandbox/sqlite-store";
-import {
-  INITIAL_DEMO_ROW_COUNT,
-  ROW_KEY,
-  SQLITE_STORE_ID,
-  STORE_ID,
-} from "./demo-constants";
-import { marketGrid, type MarketRow } from "./market-sqlite-store";
+import type { WorkerClient } from "@sandbox/worker-store";
+
+import type { DemoSqliteClient } from "./browser-clients";
+import { getDemoAppController } from "./app-store";
+import { INITIAL_DEMO_ROW_COUNT, STORE_ID } from "./demo-constants";
+import { LoadingGridCard } from "./grids/shared/panel";
+import { SqliteViewportGrid } from "./grids/sqlite-viewport/grid";
+import { TanstackViewportGrid } from "./grids/tanstack-viewport/grid";
 
 const licenseKey = import.meta.env.VITE_AG_GRID_LICENSE_KEY;
 if (typeof licenseKey === "string" && licenseKey.length > 0) {
@@ -43,841 +21,153 @@ if (typeof licenseKey === "string" && licenseKey.length > 0) {
 
 AgGridModuleRegistry.registerModules([AllEnterpriseModule]);
 
-function createViewportLoadingOverlay(title: string, body: string) {
-  return `
-    <div class="viewport-loading-overlay" role="status" aria-live="polite">
-      <span class="viewport-loading-overlay__pulse"></span>
-      <div class="viewport-loading-overlay__copy">
-        <strong>${title}</strong>
-        <span>${body}</span>
-      </div>
-    </div>
-  `;
-}
-
-interface WorkerMetrics {
-  lastCommitDurationMs: number | null;
-  lastCommitChangeCount: number;
-  totalCommitCount: number;
-}
-
-interface ViewportStateDiagnostics {
-  requestedRange: {
-    startRow: number;
-    endRow: number;
-  };
-  fulfilledRange: {
-    startRow: number;
-    endRow: number;
-  } | null;
-  requestVersion: number;
-  isLoading: boolean;
-  lastPatchLatencyMs: number | null;
-  ignoredPatchCount: number;
-  patchCount: number;
-}
-
-interface ViewportDatasourceClient {
-  readonly storeId: string;
-  viewportDatasource(options?: {
-    onSnapshot?: (snapshot: {
-      startRow: number;
-      endRow: number;
-      rowCount: number;
-      metrics: WorkerMetrics;
-    }) => void;
-    onViewportDiagnostics?: (diagnostics: ViewportStateDiagnostics) => void;
-  }): ViewportDatasourceLike;
-}
-
-interface DemoSqliteClient extends AgGridSqliteClient<MarketRow> {
-  pushLiveUpdate(): void;
-  setStressRate(rowsPerSecond: number): void;
-}
-
-type ViewportDatasourceLike = IViewportDatasource & {
-  refreshQuery(options?: {
-    debounce?: boolean;
-  }): void;
-};
-
-type ViewportDatasourceFactory = (
-  options: {
-    storeId: string;
-    onSnapshot?: (snapshot: {
-      startRow: number;
-      endRow: number;
-      rowCount: number;
-      metrics: WorkerMetrics;
-    }) => void;
-    onViewportDiagnostics?: (diagnostics: ViewportStateDiagnostics) => void;
-  },
-) => ViewportDatasourceLike;
-
-const COLUMN_DEFS: ReadonlyArray<ColDef<MarketRow>> = [
-  {
-    field: "symbol",
-    minWidth: 120,
-    filter: "agTextColumnFilter",
-  },
-  {
-    field: "company",
-    minWidth: 220,
-    filter: "agTextColumnFilter",
-  },
-  {
-    field: "sector",
-    minWidth: 160,
-    filter: "agTextColumnFilter",
-  },
-  {
-    field: "venue",
-    minWidth: 120,
-    filter: "agTextColumnFilter",
-  },
-  {
-    field: "price",
-    minWidth: 100,
-    filter: "agNumberColumnFilter",
-  },
-  {
-    field: "volume",
-    minWidth: 140,
-    filter: "agNumberColumnFilter",
-  },
-  {
-    field: "updatedAt",
-    minWidth: 220,
-    filter: "agTextColumnFilter",
-  },
-];
-
-const DEFAULT_COL_DEF: ColDef<MarketRow> = {
-  sortable: true,
-  filter: true,
-  floatingFilter: true,
-  resizable: true,
-  flex: 1,
-  minWidth: 120,
-};
-
-const getStableRowId = (params: GetRowIdParams<MarketRow>) =>
-  params.data ? String(params.data.id) : "";
-
-interface WorkerRowCountStatusPanelProps {
-  label: string;
-  rowCount: number;
-  commitSummary: string;
-}
-
-function formatCommitSummary(metrics: WorkerMetrics) {
-  if (metrics.lastCommitDurationMs === null) {
-    return "Awaiting worker commit";
-  }
-
-  return `${metrics.lastCommitDurationMs.toFixed(2)} ms / ${metrics.lastCommitChangeCount.toLocaleString()} rows`;
-}
-
-function WorkerRowCountStatusPanel(props: WorkerRowCountStatusPanelProps) {
-  return (
-    <span className="worker-status-bar">
-      <span className="worker-status-bar__label">{props.label}</span>
-      <strong>{props.rowCount.toLocaleString()}</strong>
-      <span className="worker-status-bar__label">Last commit</span>
-      <strong>{props.commitSummary}</strong>
-    </span>
-  );
-}
-
-function createRowCountStatusBar(
-  label: string,
-  rowCount: number,
-  metrics: WorkerMetrics,
-): StatusBar {
-  return {
-    statusPanels: [
-      {
-        key: "worker-row-count",
-        align: "left",
-        statusPanel: WorkerRowCountStatusPanel,
-        statusPanelParams: {
-          label,
-          rowCount,
-          commitSummary: formatCommitSummary(metrics),
-        },
-      },
-    ],
-  };
-}
-
-function formatViewportRange(
-  range: {
-    startRow: number;
-    endRow: number;
-  } | null,
-) {
-  if (range === null) {
-    return "Awaiting patch";
-  }
-
-  return `${range.startRow}-${Math.max(range.endRow - 1, range.startRow)}`;
-}
-
-function makeBrowserWorkerClient() {
-  return createWorkerClient(
-    () =>
-      new Worker(new URL("./grid.worker.ts", import.meta.url), {
-        type: "module",
-      }),
-  );
-}
-
-function makeBrowserSqliteWorkerClient() {
-  const worker = new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
-    type: "module",
-  });
-  const controls = new MessageChannel();
-  worker.postMessage(
-    {
-      type: "sqlite-demo-init-port",
-    },
-    [controls.port1],
-  );
-
-  return marketGrid.connect(
-    () => worker,
-    {
-      storeId: SQLITE_STORE_ID,
-    },
-  ).then((client) => ({
-    ...client,
-    pushLiveUpdate() {
-      controls.port2.postMessage({ type: "sqlite-demo-push-update" });
-    },
-    setStressRate(rowsPerSecond: number) {
-      controls.port2.postMessage({
-        type: "sqlite-demo-set-stress-rate",
-        rowsPerSecond,
-      });
-    },
-    async close() {
-      controls.port2.close();
-      await client.close();
-      worker.terminate();
-    },
-  }) satisfies DemoSqliteClient);
-}
-
-function useWorkerClient<TClient extends { close(): Promise<void> }>(
-  externalClient: TClient | undefined,
-  factory: () => Promise<TClient>,
-) {
-  const [client, setClient] = useState<TClient | null>(externalClient ?? null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (externalClient) {
-      setClient(externalClient);
-      setError(null);
-      return;
-    }
-
-    let cancelled = false;
-    let activeClient: TClient | null = null;
-
-    void factory()
-      .then((nextClient) => {
-        if (cancelled) {
-          void nextClient.close();
-          return;
-        }
-
-        activeClient = nextClient;
-        startTransition(() => {
-          setClient(nextClient);
-          setError(null);
-        });
-      })
-      .catch((cause) => {
-        const message = cause instanceof Error ? cause.message : "Failed to start worker client";
-        startTransition(() => {
-          setError(message);
-        });
-      });
-
-    return () => {
-      cancelled = true;
-      if (activeClient) {
-        void activeClient.close();
-      }
-    };
-  }, [externalClient, factory]);
-
-  return { client, error };
-}
-
-function useStoreBootstrap(
-  client: Pick<WorkerClient, "loadStore"> | null,
-  storeId: string,
-) {
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (client === null) {
-      return;
-    }
-
-    let cancelled = false;
-
-    setReady(false);
-    void client
-      .loadStore(
-        {
-          storeId,
-          rowKey: ROW_KEY,
-        },
-        {
-          kind: "generator",
-          rowCount: INITIAL_DEMO_ROW_COUNT,
-          seed: 7,
-        },
-      )
-      .then(() => {
-        if (cancelled) {
-          return;
-        }
-
-        startTransition(() => {
-          setReady(true);
-          setError(null);
-        });
-      })
-      .catch((cause) => {
-        if (cancelled) {
-          return;
-        }
-
-        const message = cause instanceof Error ? cause.message : "Failed to bootstrap store";
-        startTransition(() => {
-          setError(message);
-          setReady(false);
-        });
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [client, storeId]);
-
-  return { ready, error };
-}
-
-interface GridCardProps {
-  title: string;
-  body: string;
-  status: string;
-  children: ReactNode;
-}
-
-function GridCard(props: GridCardProps) {
-  return (
-    <section className="panel">
-      <header className="panel-header">
-        <div>
-          <p className="eyebrow">{props.status}</p>
-          <h2>{props.title}</h2>
-        </div>
-        <p className="panel-copy">{props.body}</p>
-      </header>
-      {props.children}
-    </section>
-  );
-}
-
-interface LoadingGridCardProps {
-  title: string;
-  body: string;
-  status: string;
-  message: string;
-}
-
-function LoadingGridCard(props: LoadingGridCardProps) {
-  return (
-    <GridCard
-      title={props.title}
-      body={props.body}
-      status={props.status}
-    >
-      <div className="panel-empty-state">
-        <p>{props.message}</p>
-      </div>
-    </GridCard>
-  );
-}
-
-interface ServerSideGridPanelProps {
-  collection: WorkerCollectionHandle;
-}
-
-function ServerSideGridPanel(props: ServerSideGridPanelProps) {
-  const apiRef = useRef<GridApi<MarketRow> | null>(null);
-  const [rowCount, setRowCount] = useState(0);
-  const [metrics, setMetrics] = useState<WorkerMetrics>({
-    lastCommitDurationMs: null,
-    lastCommitChangeCount: 0,
-    totalCommitCount: 0,
-  });
-
-  useEffect(() => {
-    if (apiRef.current === null) {
-      return;
-    }
-
-    apiRef.current.setGridOption(
-      "serverSideDatasource",
-      createServerSideDatasource(props.collection, {
-        storeId: props.collection.storeId,
-        onSnapshot: (snapshot) => {
-          startTransition(() => {
-            setRowCount(snapshot.rowCount);
-            setMetrics(snapshot.metrics);
-          });
-        },
-      }),
-    );
-  }, [props.collection]);
-
-  const handleReady = (event: GridReadyEvent<MarketRow>) => {
-    apiRef.current = event.api;
-    event.api.setGridOption(
-      "serverSideDatasource",
-      createServerSideDatasource(props.collection, {
-        storeId: props.collection.storeId,
-        onSnapshot: (snapshot) => {
-          startTransition(() => {
-            setRowCount(snapshot.rowCount);
-            setMetrics(snapshot.metrics);
-          });
-        },
-      }),
-    );
-  };
-
-  return (
-    <GridCard
-      title="Server-Side Pull"
-      body="AG Grid asks for row windows, the worker resolves the translated query, and SSRM stays ignorant of the full dataset."
-      status="SSRM / pull model"
-    >
-      <div className="grid-shell ag-theme-quartz">
-        <AgGridReact<MarketRow>
-          columnDefs={COLUMN_DEFS as ColDef<MarketRow>[]}
-          defaultColDef={DEFAULT_COL_DEF}
-          rowModelType="serverSide"
-          cacheBlockSize={50}
-          blockLoadDebounceMillis={0}
-          getRowId={getStableRowId}
-          rowBuffer={0}
-          onGridReady={handleReady}
-          statusBar={createRowCountStatusBar("Worker rows", rowCount, metrics)}
-        />
-      </div>
-    </GridCard>
-  );
-}
-
-interface ViewportGridPanelProps {
-  title: string;
-  body: string;
-  status: string;
-  rowLabel: string;
-  loadingOverlayTitle?: string;
-  loadingOverlayBody?: string;
-  useGridLoadingOverlay?: boolean;
-  datasourceClient: ViewportDatasourceClient;
-  createDatasource?: ViewportDatasourceFactory;
-  onPushLiveUpdate?: () => void;
-  onSetStressRate?: (rowsPerSecond: number) => void;
-}
-
-function ViewportGridPanel(props: ViewportGridPanelProps) {
-  const apiRef = useRef<GridApi<MarketRow> | null>(null);
-  const datasourceRef = useRef<ViewportDatasourceLike | null>(null);
-  const [rowsPerSecond, setRowsPerSecond] = useState(0);
-  const [rowCount, setRowCount] = useState(0);
-  const [metrics, setMetrics] = useState<WorkerMetrics>({
-    lastCommitDurationMs: null,
-    lastCommitChangeCount: 0,
-    totalCommitCount: 0,
-  });
-  const [diagnostics, setDiagnostics] = useState<ViewportStateDiagnostics>({
-    requestedRange: {
-      startRow: 0,
-      endRow: 50,
-    },
-    fulfilledRange: null,
-    requestVersion: 0,
-    isLoading: true,
-    lastPatchLatencyMs: null,
-    ignoredPatchCount: 0,
-    patchCount: 0,
-  });
-
-  useEffect(() => {
-    if (!props.useGridLoadingOverlay) {
-      apiRef.current?.setGridOption("loading", false);
-      return;
-    }
-
-    apiRef.current?.setGridOption("loading", diagnostics.isLoading);
-  }, [diagnostics.isLoading, props.useGridLoadingOverlay]);
-
-  useEffect(() => {
-    if (apiRef.current === null) {
-      return;
-    }
-
-    const datasource = props.createDatasource
-      ? props.createDatasource({
-          storeId: props.datasourceClient.storeId,
-          onSnapshot: (snapshot) => {
-            startTransition(() => {
-              setRowCount(snapshot.rowCount);
-              setMetrics(snapshot.metrics);
-            });
-          },
-          onViewportDiagnostics: (nextDiagnostics) => {
-            startTransition(() => {
-              setDiagnostics(nextDiagnostics);
-            });
-          },
-        })
-      : props.datasourceClient.viewportDatasource({
-          onSnapshot: (snapshot) => {
-            startTransition(() => {
-              setRowCount(snapshot.rowCount);
-              setMetrics(snapshot.metrics);
-            });
-          },
-          onViewportDiagnostics: (nextDiagnostics) => {
-            startTransition(() => {
-              setDiagnostics(nextDiagnostics);
-            });
-          },
-        });
-    datasourceRef.current = datasource;
-    apiRef.current.setGridOption(
-      "viewportDatasource",
-      datasource,
-    );
-    apiRef.current.setGridOption(
-      "loading",
-      props.useGridLoadingOverlay ? diagnostics.isLoading : false,
-    );
-  }, [props.createDatasource, props.datasourceClient, props.useGridLoadingOverlay]);
-
-  const handleReady = (event: GridReadyEvent<MarketRow>) => {
-    apiRef.current = event.api;
-    const datasource = props.createDatasource
-      ? props.createDatasource({
-          storeId: props.datasourceClient.storeId,
-          onSnapshot: (snapshot) => {
-            startTransition(() => {
-              setRowCount(snapshot.rowCount);
-              setMetrics(snapshot.metrics);
-            });
-          },
-          onViewportDiagnostics: (nextDiagnostics) => {
-            startTransition(() => {
-              setDiagnostics(nextDiagnostics);
-            });
-          },
-        })
-      : props.datasourceClient.viewportDatasource({
-          onSnapshot: (snapshot) => {
-            startTransition(() => {
-              setRowCount(snapshot.rowCount);
-              setMetrics(snapshot.metrics);
-            });
-          },
-          onViewportDiagnostics: (nextDiagnostics) => {
-            startTransition(() => {
-              setDiagnostics(nextDiagnostics);
-            });
-          },
-        });
-    datasourceRef.current = datasource;
-    event.api.setGridOption(
-      "viewportDatasource",
-      datasource,
-    );
-    event.api.setGridOption(
-      "loading",
-      props.useGridLoadingOverlay ? diagnostics.isLoading : false,
-    );
-  };
-
-  const refreshViewport = (options?: {
-    debounce?: boolean;
-  }) => {
-    datasourceRef.current?.refreshQuery(options);
-  };
-
-  const handleFilterChanged = (event: FilterChangedEvent<MarketRow>) => {
-    refreshViewport({
-      debounce: event.afterFloatingFilter === true,
-    });
-  };
-
-  const injectUpdate = () => {
-    const timestamp = Date.now();
-    props.onPushLiveUpdate?.();
-  };
-
-  const updateStressRate = (nextRowsPerSecond: number) => {
-    startTransition(() => {
-      setRowsPerSecond(nextRowsPerSecond);
-    });
-    props.onSetStressRate?.(nextRowsPerSecond);
-  };
-  const handleStressInput = (value: string) => {
-    updateStressRate(Number(value));
-  };
-
-  return (
-    <GridCard
-      title={props.title}
-      body={props.body}
-      status={props.status}
-    >
-      <div className="panel-actions">
-        {props.onPushLiveUpdate ? (
-          <button
-            className="action-button"
-            onClick={injectUpdate}
-            type="button"
-          >
-            Push live update
-          </button>
-        ) : null}
-        {props.onSetStressRate ? (
-          <label className="stress-control">
-            <span>Rows per second</span>
-            <input
-              aria-label="Rows per second"
-              max={2500}
-              min={0}
-              onInput={(event) => {
-                handleStressInput(event.currentTarget.value);
-              }}
-              step={10}
-              type="range"
-              value={rowsPerSecond}
-            />
-            <strong>{rowsPerSecond}</strong>
-          </label>
-        ) : null}
-        <button
-          className="action-button action-button--ghost"
-          onClick={() => {
-            refreshViewport();
-          }}
-          type="button"
-        >
-          Refresh query snapshot
-        </button>
-        {props.onSetStressRate ? (
-          <button
-            className="action-button action-button--ghost"
-            onClick={() => {
-              updateStressRate(0);
-            }}
-            type="button"
-          >
-            Stop stress stream
-          </button>
-        ) : null}
-      </div>
-      <div className="viewport-diagnostics">
-        <span>
-          Requested range <strong>{formatViewportRange(diagnostics.requestedRange)}</strong>
-        </span>
-        <span>
-          Fulfilled range <strong>{formatViewportRange(diagnostics.fulfilledRange)}</strong>
-        </span>
-        <span>
-          Patch latency{" "}
-          <strong>
-            {diagnostics.lastPatchLatencyMs === null
-              ? "Awaiting patch"
-              : `${diagnostics.lastPatchLatencyMs.toFixed(2)} ms`}
-          </strong>
-        </span>
-        <span>
-          Ignored patches <strong>{diagnostics.ignoredPatchCount}</strong>
-        </span>
-      </div>
-      <div className="grid-shell grid-shell--viewport ag-theme-quartz">
-        <AgGridReact<MarketRow>
-          columnDefs={COLUMN_DEFS as ColDef<MarketRow>[]}
-          defaultColDef={DEFAULT_COL_DEF}
-          getRowId={getStableRowId}
-          overlayLoadingTemplate={props.useGridLoadingOverlay && props.loadingOverlayTitle && props.loadingOverlayBody
-            ? createViewportLoadingOverlay(
-                props.loadingOverlayTitle,
-                props.loadingOverlayBody,
-              )
-            : undefined}
-          rowModelType="viewport"
-          statusBar={createRowCountStatusBar(props.rowLabel, rowCount, metrics)}
-          viewportRowModelPageSize={50}
-          viewportRowModelBufferSize={20}
-          rowBuffer={0}
-          onGridReady={handleReady}
-          onFilterChanged={handleFilterChanged}
-          onSortChanged={() => {
-            refreshViewport();
-          }}
-        />
-      </div>
-    </GridCard>
-  );
-}
-
 export interface AppProps {
   client?: WorkerClient;
   sqliteClient?: DemoSqliteClient;
 }
 
+const heroCardClass =
+  "rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-6 shadow-sm ring-1 ring-white/[0.04] backdrop-blur-md sm:p-8";
+
+const metricsShellClass =
+  "grid gap-px overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-800/50 shadow-sm ring-1 ring-white/[0.04]";
+
+const metricCellClass =
+  "bg-zinc-900/70 px-5 py-4 transition-colors hover:bg-zinc-900/90";
+
+const errorBannerClass =
+  "mb-4 rounded-lg border border-red-500/25 bg-red-950/40 px-4 py-3 text-sm font-medium text-red-200 ring-1 ring-red-500/10";
+
 export function App(props: AppProps) {
-  const { client, error: clientError } = useWorkerClient(props.client, makeBrowserWorkerClient);
-  const { client: sqliteClient, error: sqliteClientError } = useWorkerClient(
-    props.sqliteClient,
-    makeBrowserSqliteWorkerClient,
+  const controller = getDemoAppController({
+    client: props.client,
+    sqliteClient: props.sqliteClient,
+  });
+  const tanstackClient = useSelector(
+    controller.store,
+    (snapshot) => snapshot.context.tanstackClient,
   );
-  const { ready, error: bootstrapError } = useStoreBootstrap(client, STORE_ID);
-  const collection = client ? client.collection(STORE_ID) : null;
-  const tanstackReady = ready && collection !== null;
-  const sqliteStoreReady = sqliteClient !== null;
+  const sqliteClient = useSelector(
+    controller.store,
+    (snapshot) => snapshot.context.sqliteClient,
+  );
+  const tanstackReady = useSelector(
+    controller.store,
+    (snapshot) => snapshot.context.tanstackReady,
+  );
+  const tanstackError = useSelector(
+    controller.store,
+    (snapshot) => snapshot.context.tanstackError,
+  );
+  const sqliteError = useSelector(
+    controller.store,
+    (snapshot) => snapshot.context.sqliteError,
+  );
+  const bootstrapError = useSelector(
+    controller.store,
+    (snapshot) => snapshot.context.bootstrapError,
+  );
+  const collection = tanstackClient?.collection(STORE_ID) ?? null;
 
   return (
-    <main className="app-shell">
-      <section className="hero">
-        <div className="hero-copy">
-          <p className="eyebrow">worker-hosted query engines + ag grid enterprise</p>
-          <h1>Same grid, two worker-side query engines, one direct comparison.</h1>
-          <p>
-            Filters and sorting are decoded once, then executed inside either the TanStack
-            worker store or a SQLite Wasm worker store.
+    <main
+      className={"relative mx-auto w-full max-w-[1280px] px-4 py-10 pb-16 sm:px-6"}
+      ref={controller.attachHost}
+    >
+      <section
+        className={
+          "mb-8 grid grid-cols-1 gap-5 lg:grid-cols-[1.35fr_1fr] lg:items-stretch"
+        }
+      >
+        <div className={heroCardClass}>
+          <p
+            className={
+              "mb-2 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500"
+            }
+          >
+            {"Worker query engines · AG Grid Enterprise"}
+          </p>
+          <h1
+            className={
+              "m-0 mb-3 text-3xl font-semibold tracking-tight text-zinc-50 sm:text-4xl"
+            }
+          >
+            {"Two viewport grids, two engines, one comparison."}
+          </h1>
+          <p className={"m-0 max-w-[52ch] text-sm leading-relaxed text-zinc-400"}>
+            {
+              "Filters and sorting decode once, then run in the TanStack worker or SQLite Wasm—both on the viewport model."
+            }
           </p>
         </div>
-        <dl className="hero-metrics">
-          <div>
-            <dt>Transport</dt>
-            <dd>Effect serialized worker</dd>
+        <dl className={metricsShellClass}>
+          <div className={metricCellClass}>
+            <dt
+              className={
+                "m-0 mb-1 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500"
+              }
+            >
+              {"Transport"}
+            </dt>
+            <dd className={"m-0 text-sm font-medium text-zinc-100"}>
+              {"Effect serialized worker"}
+            </dd>
           </div>
-          <div>
-            <dt>Query compiler</dt>
-            <dd>AG Grid to TanStack DB and AG Grid to SQL</dd>
+          <div className={metricCellClass}>
+            <dt
+              className={
+                "m-0 mb-1 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500"
+              }
+            >
+              {"Compilers"}
+            </dt>
+            <dd className={"m-0 text-sm font-medium text-zinc-100"}>
+              {"AG Grid → TanStack DB · AG Grid → SQL"}
+            </dd>
           </div>
-          <div>
-            <dt>Dataset</dt>
-            <dd>{INITIAL_DEMO_ROW_COUNT.toLocaleString()} synthetic market rows</dd>
+          <div className={metricCellClass}>
+            <dt
+              className={
+                "m-0 mb-1 text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500"
+              }
+            >
+              {"Dataset"}
+            </dt>
+            <dd className={"m-0 text-sm font-medium tabular-nums text-zinc-100"}>
+              {`${INITIAL_DEMO_ROW_COUNT.toLocaleString()} synthetic rows`}
+            </dd>
           </div>
         </dl>
       </section>
 
-      {clientError ? <p className="error-banner">{clientError}</p> : null}
-      {sqliteClientError ? <p className="error-banner">{sqliteClientError}</p> : null}
-      {bootstrapError ? <p className="error-banner">{bootstrapError}</p> : null}
-      <section className="grid-stack">
-        {tanstackReady ? (
-          <ServerSideGridPanel
-            collection={collection}
-          />
+      {tanstackError ? <p className={errorBannerClass}>{tanstackError}</p> : null}
+      {sqliteError ? <p className={errorBannerClass}>{sqliteError}</p> : null}
+      {bootstrapError ? <p className={errorBannerClass}>{bootstrapError}</p> : null}
+      <section className={"flex flex-col gap-5"}>
+        {sqliteClient !== null ? (
+          <SqliteViewportGrid client={sqliteClient} />
         ) : (
           <LoadingGridCard
-            title="Server-Side Pull"
-            body="AG Grid asks for row windows, the worker resolves the translated query, and SSRM stays ignorant of the full dataset."
-            status="SSRM / pull model"
-            message="Starting the TanStack worker store and generating the shared dataset."
+            title={"SQLite SQL Viewport"}
+            body={
+              "The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
+            }
+            status={"Viewport / SQLite Wasm"}
+            message={
+              "Starting the SQLite worker store in the background. TanStack panels stay interactive while it catches up."
+            }
           />
         )}
-        {tanstackReady ? (
-          <ViewportGridPanel
-            title="Viewport Push"
-            body="The grid only owns the visible slice. The TanStack worker keeps the live query hot and streams patches back through the viewport datasource."
-            status="Viewport / TanStack push"
-            rowLabel="TanStack rows"
-            loadingOverlayTitle="Refreshing live query"
-            loadingOverlayBody="Recomputing filters and sort in the worker."
-            useGridLoadingOverlay={true}
-            datasourceClient={{
-              storeId: collection.storeId,
-              viewportDatasource(options) {
-                return createViewportDatasource(collection, {
-                  storeId: collection.storeId,
-                  onSnapshot: options?.onSnapshot,
-                  onViewportDiagnostics: options?.onViewportDiagnostics,
-                }) as ViewportDatasourceLike;
-              },
-            }}
-            onPushLiveUpdate={() => {
-              const timestamp = Date.now();
-              void collection
-                .applyTransaction({
-                  kind: "upsert",
-                  rows: [
-                    {
-                      id: `live-${timestamp}`,
-                      symbol: `L${String(timestamp).slice(-3)}`,
-                      company: `Live Market ${String(timestamp).slice(-4)}`,
-                      sector: "Technology",
-                      venue: "NASDAQ",
-                      price: 100 + ((timestamp / 1000) % 250),
-                      volume: 50_000,
-                      active: true,
-                      createdAt: new Date(timestamp).toISOString(),
-                      updatedAt: new Date(timestamp).toISOString(),
-                    },
-                  ],
-                })
-                .then(() => undefined);
-            }}
-            onSetStressRate={(rowsPerSecond) => {
-              void collection.setStressRate(rowsPerSecond).then(() => undefined);
-            }}
-          />
+        {tanstackReady && collection !== null ? (
+          <TanstackViewportGrid collection={collection} />
         ) : (
           <LoadingGridCard
-            title="Viewport Push"
-            body="The grid only owns the visible slice. The TanStack worker keeps the live query hot and streams patches back through the viewport datasource."
-            status="Viewport / TanStack push"
-            message="Waiting for the TanStack viewport store to finish booting."
-          />
-        )}
-        {sqliteStoreReady ? (
-          <ViewportGridPanel
-            title="SQLite SQL Viewport"
-            body="The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
-            status="Viewport / SQLite Wasm"
-            rowLabel="SQLite rows"
-            useGridLoadingOverlay={false}
-            datasourceClient={sqliteClient}
-            onPushLiveUpdate={() => {
-              sqliteClient.pushLiveUpdate();
-            }}
-            onSetStressRate={(rowsPerSecond) => {
-              sqliteClient.setStressRate(rowsPerSecond);
-            }}
-          />
-        ) : (
-          <LoadingGridCard
-            title="SQLite SQL Viewport"
-            body="The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
-            status="Viewport / SQLite Wasm"
-            message="Starting the SQLite worker store in the background. TanStack panels stay interactive while it catches up."
+            title={"Viewport Push"}
+            body={
+              "The grid only owns the visible slice. The TanStack worker keeps the live query hot and streams patches back through the viewport datasource."
+            }
+            status={"Viewport / TanStack push"}
+            message={"Waiting for the TanStack viewport store to finish booting."}
           />
         )}
       </section>
