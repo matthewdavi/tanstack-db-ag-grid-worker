@@ -1,24 +1,30 @@
-# TanStack AG Grid Monorepo
+# ag grid sqlite worker demo
 
-This repository is organized as a Bun workspace managed by Turbo.
+this repo is a demo of running sqlite wasm inside a worker and letting ag grid talk to it through the viewport row model.
 
-## Workspace Layout
+the whole point is that the ui thread stays thin while filtering, sorting, row counts, and viewport queries happen off-thread. that setup is really fast. inserts are basically all in the ~1ms range in the worker, even while the grid keeps rendering just the visible slice instead of having a public meltdown.
 
-- `apps/demo`: the Vite demo app.
-- `packages/ag-grid-translator`: AG Grid model translation helpers.
-- `packages/worker-store`: worker-backed store runtime and adapters.
-- `packages/msgpackr-extract`: local override for `msgpackr-extract`.
+## what this repo is
 
-## Commands
+- `apps/demo`: the vite demo app showing the sqlite worker setup.
+- `packages/sqlite-store`: the actual ag grid + sqlite worker package.
+- `packages/ag-grid-translator`: the ag grid filter/sort translation layer that normalizes query state before sqlite turns it into sql.
 
-- `bun run dev`: start the demo app through Turbo.
+## what the demo is proving
+
+- sqlite in a worker is a clean way to keep main-thread work light.
+- ag grid's viewport row model is a good fit when the worker owns querying.
+- write churn can stay cheap because the worker coalesces refreshes and only sends back the current window plus row count.
+- you do not need a giant generic client architecture to make this work.
+
+## commands
+
+- `bun run dev`: start the demo through turbo.
 - `bun run build`: run workspace builds.
-- `bun run typecheck`: run package-aware TypeScript checks.
+- `bun run typecheck`: run typescript checks across the workspace.
 - `bun run test`: run tests across the workspace.
-- `bun run check`: run build, typecheck, and test in one pass.
+- `bun run check`: run build, typecheck, and test together.
 
-## Notes
+## note
 
-- Workspace packages are consumed by package name, not by hand-written source aliases.
-- TypeScript checks run source-first in each package without an extra declaration-build layer.
-- Shared tooling lives at the repo root; package scripts use normal binary resolution instead of direct `.bin` paths.
+this repo is centered on one story now: use sqlite in a worker, keep the browser side read-only and thin, and let ag grid render the viewport without dragging the whole app into the mud.

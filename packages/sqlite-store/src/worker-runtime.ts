@@ -81,11 +81,15 @@ export class SqliteWorkerRuntime<TRow extends SqliteRow = SqliteRow> {
     return this.registry.setStressRate(this.storeId, rowsPerSecond);
   }
 
-  launchBrowserWorker() {
+  serve() {
     return Effect.gen(this, function* () {
       yield* Effect.promise(() => this.ensureLoaded());
       yield* launchSqliteBrowserWorker(this.registry);
     });
+  }
+
+  launchBrowserWorker() {
+    return this.serve();
   }
 
   private async ensureLoaded() {

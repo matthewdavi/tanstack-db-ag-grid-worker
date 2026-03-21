@@ -3,14 +3,8 @@
 import "ag-grid-enterprise";
 
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import * as Stream from "effect/Stream";
 import { render, screen, waitFor, within } from "@testing-library/react";
 
-import type {
-  ViewportPatch,
-  WorkerClient,
-  WorkerCollectionHandle,
-} from "@sandbox/worker-store";
 import type { AgGridSqliteClient } from "@sandbox/sqlite-store";
 
 import { App } from "./app";
@@ -109,66 +103,6 @@ afterAll(() => {
   vi.restoreAllMocks();
 });
 
-function makeClient(): WorkerClient {
-  const collection: WorkerCollectionHandle = {
-    storeId: "olympic-athletes",
-    applyTransaction: vi.fn().mockResolvedValue({
-      storeId: "olympic-athletes",
-      rowCount: sampleRows.length,
-      metrics: sampleMetrics,
-    }),
-    getRows: vi.fn().mockResolvedValue({
-      storeId: "olympic-athletes",
-      startRow: 0,
-      endRow: sampleRows.length,
-      rowCount: sampleRows.length,
-      metrics: sampleMetrics,
-      rows: sampleRows,
-    }),
-    openViewportSession: vi.fn().mockImplementation(() => ({
-      sessionId: "viewport-session",
-      updates: Stream.fromIterable<ViewportPatch>([{
-        storeId: "olympic-athletes",
-        startRow: 0,
-        endRow: sampleRows.length,
-        rowCount: sampleRows.length,
-        latencyMs: 12.5,
-        metrics: sampleMetrics,
-        rows: sampleRows,
-      }]),
-      replace: vi.fn().mockResolvedValue({
-        sessionId: "viewport-session",
-        replaced: true,
-      }),
-      close: vi.fn().mockResolvedValue({
-        sessionId: "viewport-session",
-        closed: true,
-      }),
-    })),
-    setStressRate: vi.fn().mockResolvedValue({
-      storeId: "olympic-athletes",
-      rowsPerSecond: 0,
-      running: false,
-      rowCount: sampleRows.length,
-      metrics: sampleMetrics,
-    }),
-    dispose: vi.fn().mockResolvedValue({
-      storeId: "olympic-athletes",
-      disposed: true,
-    }),
-  };
-
-  return {
-    loadStore: vi.fn().mockResolvedValue({
-      storeId: "olympic-athletes",
-      rowCount: sampleRows.length,
-      metrics: sampleMetrics,
-    }),
-    collection: vi.fn().mockReturnValue(collection),
-    close: vi.fn().mockResolvedValue(undefined),
-  };
-}
-
 function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
   pushLiveUpdate(): void;
   setStressRate(rowsPerSecond: number): void;
@@ -227,27 +161,18 @@ function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
 }
 
 describe("demo app", () => {
-  it("mounts both viewport grids and wires the demo panels", async () => {
-    const client = makeClient();
+  it("mounts the sqlite viewport grid and wires the demo panel", async () => {
     const sqliteClient = makeSqliteClient();
-    render(<App client={client} sqliteClient={sqliteClient} />);
+    render(<App sqliteClient={sqliteClient} />);
 
     const sqliteHeading = await screen.findByRole("heading", { name: "SQLite SQL Viewport" });
-    const viewportHeading = await screen.findByRole("heading", { name: "Viewport Push" });
-    const viewportPanel = viewportHeading.closest("section");
     const sqlitePanel = sqliteHeading.closest("section");
 
-    expect(viewportPanel).not.toBeNull();
     expect(sqlitePanel).not.toBeNull();
-    expect(
-      sqliteHeading.compareDocumentPosition(viewportHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeGreaterThan(0);
 
     await screen.findAllByText("Ada Insights Holdings");
 
     await waitFor(() => {
-      expect(client.collection).toHaveBeenCalledWith("olympic-athletes");
-      expect(client.loadStore).toHaveBeenCalled();
       expect(sqliteClient.viewportDatasource).toHaveBeenCalled();
     });
 
@@ -260,21 +185,9 @@ describe("demo app", () => {
     await screen.findAllByText("Patch latency");
   });
 
-  it("renders the viewport stress controls", async () => {
-    const client = makeClient();
+  it("renders the sqlite viewport stress controls", async () => {
     const sqliteClient = makeSqliteClient();
-    render(<App client={client} sqliteClient={sqliteClient} />);
-
-    const viewportHeading = (await screen.findAllByRole("heading", { name: "Viewport Push" }))[0];
-    const viewportPanel = viewportHeading.closest("section");
-
-    expect(viewportPanel).not.toBeNull();
-    await within(viewportPanel as HTMLElement).findByRole("slider", {
-      name: "Rows per second",
-    });
-    expect(
-      within(viewportPanel as HTMLElement).getByRole("button", { name: "Stop stress stream" }),
-    );
+    render(<App sqliteClient={sqliteClient} />);
 
     const sqliteHeading = (await screen.findAllByRole("heading", { name: "SQLite SQL Viewport" }))[0];
     const sqlitePanel = sqliteHeading.closest("section");
@@ -290,5 +203,4 @@ describe("demo app", () => {
       within(sqlitePanel as HTMLElement).getByRole("button", { name: "Stop stress stream" }),
     );
   });
-
 });

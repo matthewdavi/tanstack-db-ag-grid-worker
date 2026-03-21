@@ -70,7 +70,7 @@ const runtime = marketGrid.createWorkerRuntime({
 Effect.runFork(
   Effect.gen(function* () {
     yield* Effect.promise(() => runtime.replaceAll(seedRows));
-    yield* runtime.launchBrowserWorker();
+    yield* runtime.serve();
   }),
 );
 ```
@@ -81,7 +81,7 @@ Worker runtime methods:
 - `upsert(rows)`
 - `delete(ids)`
 - `setStressRate(rowsPerSecond)` for demo-style worker-owned write churn
-- `launchBrowserWorker()`
+- `serve()`
 
 The worker runtime owns:
 

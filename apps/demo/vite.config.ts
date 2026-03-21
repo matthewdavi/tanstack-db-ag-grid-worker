@@ -9,7 +9,6 @@ export default defineConfig({
       "@sqlite.org/sqlite-wasm",
       "@sandbox/ag-grid-translator",
       "@sandbox/sqlite-store",
-      "@sandbox/worker-store",
     ],
   },
   server: {

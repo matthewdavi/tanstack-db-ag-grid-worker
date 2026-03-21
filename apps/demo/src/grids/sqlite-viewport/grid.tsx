@@ -34,9 +34,9 @@ export function SqliteViewportGrid(props: SqliteViewportGridProps) {
     <GridCard
       title={"SQLite SQL Viewport"}
       body={
-        "The grid asks the SQLite worker for count plus window rows, and write-driven refreshes are coalesced before patching the UI."
+        "ridiculously fast. sql + viewport live in the worker. ui thread doesn't know what's going on. it thinks it's rendering like 50 rows but there are no fewer than 100,000 in there."
       }
-      status={"Viewport / SQLite Wasm"}
+      status={"fast / sqlite"}
     >
       <div className={"flex flex-wrap items-center gap-2 px-5 pb-4 pt-1"}>
         <button

@@ -13,8 +13,6 @@
     "@faker-js/faker": "^9.9.0",
     "@sandbox/ag-grid-translator": "workspace:*",
     "@sandbox/sqlite-store": "workspace:*",
-    "@sandbox/worker-store": "workspace:*",
-    "@tanstack/react-db": "^0.1.75",
     "@xstate/store": "^3.17.0",
     "@xstate/store-react": "^1.0.1",
     "ag-grid-community": "^35.1.0",

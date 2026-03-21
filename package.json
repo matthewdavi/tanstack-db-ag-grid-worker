@@ -3,9 +3,6 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.2.22",
-  "overrides": {
-    "msgpackr-extract": "workspace:*"
-  },
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -18,8 +15,7 @@
     "test": "turbo test",
     "test:watch": "vitest --root .",
     "typecheck": "turbo typecheck",
-    "check": "turbo run build typecheck test",
-    "bench:collection": "bun run packages/worker-store/scripts/stress-collection.ts"
+    "check": "turbo run build typecheck test"
   },
   "devDependencies": {
     "@effect/vitest": "^0.28.0",

@@ -92,6 +92,6 @@ self.addEventListener("message", (event: MessageEvent<unknown>) => {
 Effect.runFork(
   Effect.gen(function* () {
     yield* Effect.promise(() => bootPromise);
-    yield* runtime.launchBrowserWorker();
+    yield* runtime.serve();
   }),
 );
