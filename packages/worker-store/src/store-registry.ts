@@ -328,7 +328,9 @@ export class StoreRegistry {
     const self = this;
     return Effect.gen(function* () {
       if (self.viewportSessions.has(request.sessionId)) {
-        yield* Effect.fail(`Viewport session already exists: ${request.sessionId}`);
+        return yield* Effect.fail(
+          `Viewport session already exists: ${request.sessionId}`,
+        );
       }
 
       yield* Effect.try({

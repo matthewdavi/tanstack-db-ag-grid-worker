@@ -1,51 +1,58 @@
-import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
-import type * as ParseResult from "effect/ParseResult";
-import * as Scope from "effect/Scope";
-import * as Stream from "effect/Stream";
-
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker";
-import * as Worker from "@effect/platform/Worker";
-import type { WorkerError } from "@effect/platform/WorkerError";
-
-import type {
-  CloseViewportSessionSuccess,
-  OpenViewportSessionRequest,
-  ReplaceViewportSessionSuccess,
-  ViewportPatch,
-  WorkerRequest,
-} from "./worker-contract";
-import {
-  CloseViewportSession,
-  OpenViewportSession,
-  ReplaceViewportSession,
-} from "./worker-contract";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as ServiceMap from "effect/ServiceMap";
+import * as Stream from "effect/Stream";
+import * as RpcClient from "effect/unstable/rpc/RpcClient";
+import type { RpcClientError } from "effect/unstable/rpc/RpcClientError";
+import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+import * as RpcServer from "effect/unstable/rpc/RpcServer";
 
 import type { SqliteRow } from "./store-config";
+import {
+  type CloseViewportChannelSuccess,
+  type SetViewportIntentSuccess,
+  type ViewportIntent,
+  type ViewportPatch,
+  ViewportChannelRpcs,
+} from "./worker-contract";
 
-export interface SqliteViewportSessionHandle<TRow extends SqliteRow = SqliteRow> {
-  readonly sessionId: string;
-  readonly updates: Stream.Stream<
-    ViewportPatch<TRow>,
-    string | WorkerError | ParseResult.ParseError
-  >;
-  replace(
-    request: Omit<OpenViewportSessionRequest, "sessionId" | "storeId">,
-  ): Promise<ReplaceViewportSessionSuccess>;
-  close(): Promise<CloseViewportSessionSuccess>;
+export interface SqliteViewportChannelHandle<
+  TRow extends SqliteRow = SqliteRow,
+> {
+  readonly connectionId: string;
+  readonly updates: Stream.Stream<ViewportPatch<TRow>, RpcClientError>;
+  setIntent(intent: ViewportIntent): Promise<SetViewportIntentSuccess>;
+  close(): Promise<CloseViewportChannelSuccess>;
 }
 
-export interface ReadOnlySqliteWorkerClient<TRow extends SqliteRow = SqliteRow> {
+export interface ReadOnlySqliteWorkerClient<
+  TRow extends SqliteRow = SqliteRow,
+> {
   readonly storeId: string;
-  openViewportSession(
-    request: Omit<OpenViewportSessionRequest, "storeId" | "sessionId"> & {
-      sessionId?: string;
-    },
-  ): SqliteViewportSessionHandle<TRow>;
+  openViewportChannel(options: {
+    initialIntent: ViewportIntent;
+    throttleMs: number;
+    connectionId?: string;
+  }): SqliteViewportChannelHandle<TRow>;
   close(): Promise<void>;
 }
 
-function createSessionId() {
+class SqliteViewportRpcClient extends ServiceMap.Service<
+  SqliteViewportRpcClient,
+  RpcClient.RpcClient<
+    RpcGroup.Rpcs<typeof ViewportChannelRpcs>,
+    RpcClientError
+  >
+>()("@sandbox/sqlite-store/SqliteViewportRpcClient") {
+  static layer = Layer.effect(
+    SqliteViewportRpcClient,
+    RpcClient.make(ViewportChannelRpcs),
+  );
+}
+
+function createConnectionId() {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
   }
@@ -53,56 +60,98 @@ function createSessionId() {
   return `sqlite-viewport-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export async function createReadOnlySqliteWorkerClient<TRow extends SqliteRow = SqliteRow>(
+export async function createReadOnlySqliteWorkerClient<
+  TRow extends SqliteRow = SqliteRow,
+>(
   spawn: (id: number) => globalThis.Worker | globalThis.SharedWorker | MessagePort,
   options: {
     storeId: string;
   },
 ): Promise<ReadOnlySqliteWorkerClient<TRow>> {
-  const scope = await Effect.runPromise(Scope.make());
-  const worker = await Effect.runPromise(
-    Scope.extend(
-      Worker.makeSerialized<WorkerRequest>({}),
-      scope,
-    ).pipe(Effect.provide(BrowserWorker.layer(spawn))),
+  const runtime = ManagedRuntime.make(
+    SqliteViewportRpcClient.layer.pipe(
+      // Keep one lane free for unary control calls while the viewport stream stays open.
+      Layer.provide(RpcClient.layerProtocolWorker({ size: 2 })),
+      Layer.provide(BrowserWorker.layer(spawn)),
+      Layer.merge(
+        Layer.succeed(RpcServer.Protocol)({
+          supportsAck: true,
+        } as never),
+      ),
+    ),
   );
+
+  const connectChannel = (rpcOptions: {
+    connectionId: string;
+    intent: ViewportIntent;
+    throttleMs: number;
+  }) =>
+    SqliteViewportRpcClient.use((rpcClient) =>
+      Effect.succeed(rpcClient.ConnectViewportChannel(rpcOptions)),
+    ) as unknown as Effect.Effect<
+      Stream.Stream<ViewportPatch<TRow>, RpcClientError>,
+      RpcClientError | string,
+      never
+    >;
+
+  const setViewportIntent = (rpcOptions: {
+    connectionId: string;
+    intent: ViewportIntent;
+  }) =>
+    SqliteViewportRpcClient.use((rpcClient) =>
+      rpcClient.SetViewportIntent(rpcOptions),
+    ) as unknown as Effect.Effect<
+      SetViewportIntentSuccess,
+      RpcClientError | string,
+      never
+    >;
+
+  const closeViewportChannel = (rpcOptions: { connectionId: string }) =>
+    SqliteViewportRpcClient.use((rpcClient) =>
+      rpcClient.CloseViewportChannel(rpcOptions),
+    ) as unknown as Effect.Effect<
+      CloseViewportChannelSuccess,
+      RpcClientError | string,
+      never
+    >;
 
   return {
     storeId: options.storeId,
-    openViewportSession(request) {
-      const sessionId = request.sessionId ?? createSessionId();
+    openViewportChannel(channelOptions) {
+      const connectionId = channelOptions.connectionId ?? createConnectionId();
+
       return {
-        sessionId,
-        updates: worker.execute(
-          new OpenViewportSession({
-            sessionId,
-            storeId: options.storeId,
-            startRow: request.startRow,
-            endRow: request.endRow,
-            query: request.query,
-          }),
-        ),
-        replace(nextRequest) {
-          return Effect.runPromise(
-            worker.executeEffect(
-              new ReplaceViewportSession({
-                sessionId,
-                startRow: nextRequest.startRow,
-                endRow: nextRequest.endRow,
-                query: nextRequest.query,
+        connectionId,
+        updates: Stream.unwrap(
+          Effect.promise(() =>
+            runtime.runPromise(
+              connectChannel({
+                connectionId,
+                intent: channelOptions.initialIntent,
+                throttleMs: channelOptions.throttleMs,
               }),
-            ),
+            )
+          ),
+        ) as Stream.Stream<ViewportPatch<TRow>, RpcClientError>,
+        setIntent(intent) {
+          return runtime.runPromise(
+            setViewportIntent({
+              connectionId,
+              intent,
+            }),
           );
         },
         close() {
-          return Effect.runPromise(
-            worker.executeEffect(new CloseViewportSession({ sessionId })),
+          return runtime.runPromise(
+            closeViewportChannel({
+              connectionId,
+            }),
           );
         },
-      } as SqliteViewportSessionHandle<TRow>;
+      };
     },
     close() {
-      return Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
+      return runtime.dispose();
     },
   };
 }

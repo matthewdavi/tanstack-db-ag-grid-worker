@@ -11,6 +11,6 @@
   },
   "dependencies": {
     "ag-grid-community": "^35.1.0",
-    "effect": "^3.19.19"
+    "effect": "4.0.0-beta.36"
   }
 }

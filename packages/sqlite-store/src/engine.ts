@@ -1,11 +1,23 @@
-import * as Effect from "effect/Effect";
+import type * as Effect from "effect/Effect";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import type { GridStoreAdapterOptions, ViewportDatasourceHandle } from "./ag-grid-adapters";
+import type {
+  GridStoreAdapterOptions,
+  SqliteViewportDatasource,
+} from "./ag-grid-adapters";
 import { createSqliteViewportDatasource } from "./ag-grid-adapters";
-import { defineSqliteStore, type SqliteRow } from "./store-config";
+import {
+  defineSqliteStore,
+  type SqliteRow,
+  type SqliteStoreDefinition,
+} from "./store-config";
 import type { SqliteRowFactoryHooks } from "./store-config";
 import { createReadOnlySqliteWorkerClient } from "./worker-client";
-import { SqliteWorkerRuntime, type SqliteWorkerRuntimeOptions } from "./worker-runtime";
+import {
+  makeSqliteWorkerService,
+  type SqliteWorkerService,
+  type SqliteWorkerServiceOptions,
+} from "./worker-runtime";
 
 type InferTableRow<TTable> = TTable extends { $inferSelect: infer TRow }
   ? Extract<TRow, SqliteRow>
@@ -24,10 +36,19 @@ export interface AgGridSqliteEngineOptions<
 
 export interface AgGridSqliteClient<TRow extends SqliteRow = SqliteRow> {
   readonly storeId: string;
-  viewportDatasource(
-    options?: Omit<GridStoreAdapterOptions, "storeId">,
-  ): ViewportDatasourceHandle;
+  open(options?: GridStoreAdapterOptions): SqliteViewportDatasource;
   close(): Promise<void>;
+}
+
+export interface AgGridSqliteWorkerRuntime {
+  readonly storeId: string;
+  readonly serve: Effect.Effect<never, unknown, never>;
+  readonly invalidate: Effect.Effect<void>;
+  readonly close: Effect.Effect<void>;
+}
+
+export interface AgGridSqliteWorkerRuntimeOptions {
+  storeId: string;
 }
 
 export interface AgGridSqliteEngine<
@@ -36,9 +57,14 @@ export interface AgGridSqliteEngine<
 > {
   readonly table: TTable;
   readonly rowKey: RowKeyOf<TRow>;
-  createWorkerRuntime(
-    options: SqliteWorkerRuntimeOptions,
-  ): SqliteWorkerRuntime<TRow>;
+  readonly store: SqliteStoreDefinition<TTable, TRow>;
+  makeWorkerService(
+    options: AgGridSqliteWorkerRuntimeOptions,
+  ): Effect.Effect<
+    AgGridSqliteWorkerRuntime,
+    never,
+    SqlClient.SqlClient
+  >;
   connect(
     spawn: (id: number) => globalThis.Worker | globalThis.SharedWorker | MessagePort,
     options: {
@@ -55,8 +81,12 @@ export function defineAgGridSqliteEngine<TTable extends object>(
   return {
     table: options.table,
     rowKey: options.rowKey,
-    createWorkerRuntime(runtimeOptions) {
-      return new SqliteWorkerRuntime(store, runtimeOptions);
+    store,
+    makeWorkerService(runtimeOptions) {
+      return makeSqliteWorkerService(
+        store,
+        runtimeOptions satisfies SqliteWorkerServiceOptions,
+      ) as Effect.Effect<SqliteWorkerService, never, SqlClient.SqlClient>;
     },
     async connect(spawn, connectOptions) {
       const client = await createReadOnlySqliteWorkerClient<InferTableRow<TTable>>(spawn, {
@@ -65,11 +95,8 @@ export function defineAgGridSqliteEngine<TTable extends object>(
 
       return {
         storeId: connectOptions.storeId,
-        viewportDatasource(viewportOptions = {}) {
-          return createSqliteViewportDatasource(client, {
-            ...viewportOptions,
-            storeId: connectOptions.storeId,
-          });
+        open(viewportOptions = {}) {
+          return createSqliteViewportDatasource(client, viewportOptions);
         },
         close() {
           return client.close();

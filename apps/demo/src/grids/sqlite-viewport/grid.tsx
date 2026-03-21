@@ -20,7 +20,6 @@ interface SqliteViewportGridProps {
 export function SqliteViewportGrid(props: SqliteViewportGridProps) {
   const { controller, gridProps } = getSqliteViewportGridModel(props.client);
   const rowCount = useSelector(controller.store, (snapshot) => snapshot.context.rowCount);
-  const metrics = useSelector(controller.store, (snapshot) => snapshot.context.metrics);
   const diagnostics = useSelector(
     controller.store,
     (snapshot) => snapshot.context.diagnostics,
@@ -64,13 +63,6 @@ export function SqliteViewportGrid(props: SqliteViewportGridProps) {
         </label>
         <button
           className={viewportGhostButtonClass}
-          onClick={controller.onSortChanged}
-          type={"button"}
-        >
-          {"Refresh query snapshot"}
-        </button>
-        <button
-          className={viewportGhostButtonClass}
           onClick={controller.onStopStressStream}
           type={"button"}
         >
@@ -81,7 +73,7 @@ export function SqliteViewportGrid(props: SqliteViewportGridProps) {
       <div className={viewportGridChromeClass}>
         <AgGridReact<MarketRow>
           {...gridProps}
-          statusBar={createRowCountStatusBar("SQLite rows", rowCount, metrics)}
+          statusBar={createRowCountStatusBar("SQLite rows", rowCount)}
         />
       </div>
     </GridCard>

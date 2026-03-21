@@ -1,97 +1,96 @@
+import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+import * as RpcServer from "effect/unstable/rpc/RpcServer";
+import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient";
 
 import {
-  INITIAL_DEMO_ROW_COUNT,
+  CloseViewportChannel,
+  ConnectViewportChannel,
+  layerSqliteViewportChannelService,
+  SetViewportIntent,
+  SqliteViewportChannelService,
+} from "@sandbox/sqlite-store";
+
+import {
   SQLITE_STORE_ID,
 } from "./demo-constants";
-import {
-  createMarketRowFactory,
-  generateMarketRows,
-  marketGrid,
-} from "./market-sqlite-store";
+import { PushLiveUpdate, SetStressRate } from "./demo-control-rpc";
+import { DemoControlService } from "./demo-control-service";
+import { DemoWriteService } from "./demo-write-service";
+import { marketGrid } from "./market-sqlite-store";
 
-const runtime = marketGrid.createWorkerRuntime({
+const WorkerRpcs = RpcGroup.make(
+  ConnectViewportChannel,
+  SetViewportIntent,
+  CloseViewportChannel,
+  PushLiveUpdate,
+  SetStressRate,
+);
+
+const sqliteLayer = SqliteClient.layerMemory({});
+
+const queryRuntimeLayer = layerSqliteViewportChannelService(marketGrid.store, {
   storeId: SQLITE_STORE_ID,
-});
+}).pipe(
+  Layer.provideMerge(sqliteLayer),
+);
 
-type DemoWorkerMessage =
-  | { type: "sqlite-demo-push-update" }
-  | { type: "sqlite-demo-set-stress-rate"; rowsPerSecond: number };
+const demoWriteLayer = DemoWriteService.layer.pipe(
+  Layer.provideMerge(queryRuntimeLayer),
+);
 
-type DemoControlPortInitMessage = {
-  type: "sqlite-demo-init-port";
-};
+const demoControlRuntimeLayer = DemoControlService.layer.pipe(
+  Layer.provideMerge(demoWriteLayer),
+);
 
-const makeLiveRow = createMarketRowFactory(7, INITIAL_DEMO_ROW_COUNT, {
-  realtimeTimestamps: true,
-});
+const workerRpcLive = WorkerRpcs.toLayer(
+  Effect.gen(function* () {
+    const queryService = yield* SqliteViewportChannelService;
+    const demoControls = yield* DemoControlService;
 
-function isDemoWorkerMessage(value: unknown): value is DemoWorkerMessage {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
+    return WorkerRpcs.of({
+      ConnectViewportChannel: (request) =>
+        queryService.connect(
+          request.connectionId,
+          request.intent,
+          { throttleMs: request.throttleMs },
+        ),
+      SetViewportIntent: (request) =>
+        queryService.setIntent(request.connectionId, request.intent),
+      CloseViewportChannel: (request) =>
+        queryService.close(request.connectionId),
+      PushLiveUpdate: () =>
+        demoControls.pushLiveUpdate.pipe(
+          Effect.mapError((error) => error.message),
+          Effect.as({ applied: true } as const),
+        ),
+      SetStressRate: (request) =>
+        demoControls.setStressRate(request.rowsPerSecond).pipe(
+          Effect.mapError((error) => error.message),
+          Effect.as({ rowsPerSecond: request.rowsPerSecond }),
+        ),
+    });
+  }),
+).pipe(
+  Layer.provide(demoControlRuntimeLayer),
+);
 
-  const candidate = value as Record<string, unknown>;
-  if (candidate.type === "sqlite-demo-push-update") {
-    return true;
-  }
-
-  return candidate.type === "sqlite-demo-set-stress-rate" &&
-    typeof candidate.rowsPerSecond === "number";
-}
-
-const bootPromise = runtime.replaceAll(generateMarketRows(INITIAL_DEMO_ROW_COUNT, 7));
-let demoPort: MessagePort | null = null;
-
-function handleDemoMessage(message: DemoWorkerMessage) {
-  if (message.type === "sqlite-demo-push-update") {
-    Effect.runFork(
-      Effect.promise(async () => {
-        await bootPromise;
-        return runtime.upsert([makeLiveRow()]);
-      }),
-    );
-    return;
-  }
-
-  Effect.runFork(
-    Effect.promise(async () => {
-      await bootPromise;
-      return runtime.setStressRate(message.rowsPerSecond);
-    }),
-  );
-}
-
-function isDemoControlPortInitMessage(value: unknown): value is DemoControlPortInitMessage {
-  return typeof value === "object" &&
-    value !== null &&
-    (value as Record<string, unknown>).type === "sqlite-demo-init-port";
-}
-
-self.addEventListener("message", (event: MessageEvent<unknown>) => {
-  if (!isDemoControlPortInitMessage(event.data) || event.ports.length === 0) {
-    return;
-  }
-
-  demoPort?.close();
-  demoPort = event.ports[0] ?? null;
-  if (demoPort === null) {
-    return;
-  }
-
-  demoPort.onmessage = (messageEvent: MessageEvent<unknown>) => {
-    if (!isDemoWorkerMessage(messageEvent.data)) {
-      return;
-    }
-
-    handleDemoMessage(messageEvent.data);
-  };
-  demoPort.start?.();
-});
+const workerLayer = RpcServer.layer(WorkerRpcs).pipe(
+  Layer.provide(workerRpcLive),
+  Layer.provide(RpcServer.layerProtocolWorkerRunner),
+  Layer.provide(BrowserWorkerRunner.layer),
+);
 
 Effect.runFork(
-  Effect.gen(function* () {
-    yield* Effect.promise(() => bootPromise);
-    yield* runtime.serve();
-  }),
+  // RpcServer.layer still leaks an `unknown` input in the current beta typing here.
+  (Layer.launch(workerLayer).pipe(
+    Effect.catchCause((cause) =>
+      Effect.sync(() => {
+        console.error("[sqlite-worker] boot failed", Cause.pretty(cause));
+      })
+    ),
+  ) as unknown as Effect.Effect<void, never, never>),
 );

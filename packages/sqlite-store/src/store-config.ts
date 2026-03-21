@@ -11,13 +11,6 @@ type RowKeyOf<TRow extends SqliteRow> = Extract<keyof TRow, string>;
 
 export interface SqliteRowFactoryHooks<TRow extends SqliteRow> {
   generateRows?(rowCount: number, seed?: number | null): ReadonlyArray<TRow>;
-  createStressRowFactory?(
-    seed: number,
-    startIndex: number,
-    options?: {
-      realtimeTimestamps?: boolean;
-    },
-  ): () => TRow;
 }
 
 export interface SqliteStoreColumn<Field extends string = string> {

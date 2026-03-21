@@ -106,9 +106,9 @@ export function ViewportDiagnosticsRow(props: ViewportDiagnosticsRowProps) {
         </strong>
       </span>
       <span>
-        Ignored patches{" "}
+        Patch count{" "}
         <strong className={"font-semibold text-zinc-200"}>
-          {diagnostics.ignoredPatchCount}
+          {diagnostics.patchCount}
         </strong>
       </span>
     </div>

@@ -124,30 +124,28 @@ const TransactionSchema = Schema.Union(
   }),
 ) as Schema.Schema<StoreTransaction>;
 
-export class LoadStore extends Schema.TaggedRequest<LoadStore>("LoadStore")(
-  "LoadStore",
+export class LoadStore extends Schema.TaggedRequest<LoadStore>()("LoadStore", {
+  failure: Schema.String,
+  success: LoadStoreSuccessSchema,
+  payload: {
+    definition: StoreDefinitionSchema,
+    source: StoreSourceSchema,
+  },
+}) {}
+
+export class ApplyTransaction extends Schema.TaggedRequest<ApplyTransaction>()(
+  "ApplyTransaction",
   {
     failure: Schema.String,
-    success: LoadStoreSuccessSchema,
+    success: ApplyTransactionSuccessSchema,
     payload: {
-      definition: StoreDefinitionSchema,
-      source: StoreSourceSchema,
+      storeId: Schema.String,
+      transaction: TransactionSchema,
     },
   },
 ) {}
 
-export class ApplyTransaction extends Schema.TaggedRequest<ApplyTransaction>(
-  "ApplyTransaction",
-)("ApplyTransaction", {
-  failure: Schema.String,
-  success: ApplyTransactionSuccessSchema,
-  payload: {
-    storeId: Schema.String,
-    transaction: TransactionSchema,
-  },
-}) {}
-
-export class GetRows extends Schema.TaggedRequest<GetRows>("GetRows")("GetRows", {
+export class GetRows extends Schema.TaggedRequest<GetRows>()("GetRows", {
   failure: Schema.String,
   success: SsrmBlockResponseSchema,
   payload: {
@@ -158,9 +156,9 @@ export class GetRows extends Schema.TaggedRequest<GetRows>("GetRows")("GetRows",
   },
 }) {}
 
-export class OpenViewportSession extends Schema.TaggedRequest<OpenViewportSession>(
+export class OpenViewportSession extends Schema.TaggedRequest<OpenViewportSession>()(
   "OpenViewportSession",
-)("OpenViewportSession", {
+  {
   failure: Schema.String,
   success: ViewportPatchSchema,
   payload: {
@@ -172,9 +170,9 @@ export class OpenViewportSession extends Schema.TaggedRequest<OpenViewportSessio
   },
 }) {}
 
-export class ReplaceViewportSession extends Schema.TaggedRequest<ReplaceViewportSession>(
+export class ReplaceViewportSession extends Schema.TaggedRequest<ReplaceViewportSession>()(
   "ReplaceViewportSession",
-)("ReplaceViewportSession", {
+  {
   failure: Schema.String,
   success: ReplaceViewportSessionSuccessSchema,
   payload: {
@@ -185,9 +183,9 @@ export class ReplaceViewportSession extends Schema.TaggedRequest<ReplaceViewport
   },
 }) {}
 
-export class CloseViewportSession extends Schema.TaggedRequest<CloseViewportSession>(
+export class CloseViewportSession extends Schema.TaggedRequest<CloseViewportSession>()(
   "CloseViewportSession",
-)("CloseViewportSession", {
+  {
   failure: Schema.String,
   success: CloseViewportSessionSuccessSchema,
   payload: {
@@ -195,7 +193,7 @@ export class CloseViewportSession extends Schema.TaggedRequest<CloseViewportSess
   },
 }) {}
 
-export class DisposeStore extends Schema.TaggedRequest<DisposeStore>("DisposeStore")(
+export class DisposeStore extends Schema.TaggedRequest<DisposeStore>()(
   "DisposeStore",
   {
     failure: Schema.String,
@@ -206,7 +204,7 @@ export class DisposeStore extends Schema.TaggedRequest<DisposeStore>("DisposeSto
   },
 ) {}
 
-export class SetStressRate extends Schema.TaggedRequest<SetStressRate>("SetStressRate")(
+export class SetStressRate extends Schema.TaggedRequest<SetStressRate>()(
   "SetStressRate",
   {
     failure: Schema.String,

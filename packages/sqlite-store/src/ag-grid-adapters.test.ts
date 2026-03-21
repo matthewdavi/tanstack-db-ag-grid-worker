@@ -1,9 +1,10 @@
-import { describe, vi } from "vitest";
-import * as Duration from "effect/Duration";
-import * as Effect from "effect/Effect";
+import {
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import * as Stream from "effect/Stream";
-import * as TestClock from "effect/TestClock";
-import { effect, expect } from "@effect/vitest";
 
 import type {
   ColumnState,
@@ -18,130 +19,238 @@ type TestRow = {
 };
 
 function makeViewportParams() {
+  const listeners = new Map<string, Set<() => void>>();
+
   return {
     api: {
       getFilterModel: () => ({}),
-      getColumnState: () => [] as ReadonlyArray<ColumnState>,
+      getColumnState: () => [] as Array<ColumnState>,
+      addEventListener: (eventName: string, listener: () => void) => {
+        const current = listeners.get(eventName) ?? new Set();
+        current.add(listener);
+        listeners.set(eventName, current);
+      },
+      removeEventListener: (eventName: string, listener: () => void) => {
+        listeners.get(eventName)?.delete(listener);
+      },
+      emit: (eventName: string) => {
+        for (const listener of listeners.get(eventName) ?? []) {
+          listener();
+        }
+      },
     } as never,
     context: {} as never,
     setRowCount: vi.fn(),
     setRowData: vi.fn(),
     getRow: vi.fn(),
-  } as IViewportDatasourceParams<TestRow>;
+  } as IViewportDatasourceParams<TestRow> & {
+    api: {
+      emit(eventName: string): void;
+    };
+  };
+}
+
+function makeDatasource() {
+  const setIntent = vi.fn().mockResolvedValue({
+    connectionId: "connection-1",
+    updated: true,
+  });
+  const close = vi.fn().mockResolvedValue({
+    connectionId: "connection-1",
+    closed: true,
+  });
+  const datasource = createSqliteViewportDatasource({
+    storeId: "stocks",
+    openViewportChannel: () => ({
+      connectionId: "connection-1",
+      updates: Stream.empty,
+      setIntent,
+      close,
+    }),
+  }, {
+    throttleMs: 125,
+  });
+
+  return {
+    close,
+    datasource,
+    setIntent,
+  };
 }
 
 describe("sqlite ag-grid adapter", () => {
-  effect("runs immediate refreshes without debounce", () =>
-    Effect.gen(function* () {
-      const runtime = yield* Effect.runtime<never>();
-      const replace = vi.fn().mockResolvedValue({
-        sessionId: "session-1",
-        replaced: true,
-      });
-      const datasource = createSqliteViewportDatasource({
-        openViewportSession: () => ({
-          sessionId: "session-1",
-          updates: Stream.empty,
-          replace,
-          close: vi.fn().mockResolvedValue({
-            sessionId: "session-1",
-            closed: true,
-          }),
+  it("opens a single worker channel with the provided throttle", () => {
+    const openViewportChannel = vi.fn().mockReturnValue({
+      connectionId: "connection-1",
+      updates: Stream.empty,
+      setIntent: vi.fn().mockResolvedValue({
+        connectionId: "connection-1",
+        updated: true,
+      }),
+      close: vi.fn().mockResolvedValue({
+        connectionId: "connection-1",
+        closed: true,
+      }),
+    });
+
+    const datasource = createSqliteViewportDatasource({
+      storeId: "stocks",
+      openViewportChannel,
+    }, {
+      throttleMs: 125,
+    });
+
+    datasource.init(makeViewportParams());
+
+    expect(openViewportChannel).toHaveBeenCalledWith({
+      initialIntent: expect.objectContaining({
+        storeId: "stocks",
+        startRow: 0,
+        endRow: 50,
+      }),
+      throttleMs: 125,
+    });
+  });
+
+  it("forwards viewport changes immediately with no browser debounce", () => {
+    const { datasource, setIntent } = makeDatasource();
+
+    datasource.init(makeViewportParams());
+    datasource.setViewportRange(20, 29);
+
+    expect(setIntent).toHaveBeenLastCalledWith(expect.objectContaining({
+      storeId: "stocks",
+      startRow: 20,
+      endRow: 30,
+    }));
+  });
+
+  it("forwards filter and sort changes on the next microtask", async () => {
+    const { datasource, setIntent } = makeDatasource();
+    const params = makeViewportParams();
+
+    datasource.init(params);
+    setIntent.mockClear();
+
+    datasource.queryChanged();
+    datasource.queryChanged();
+    await Promise.resolve();
+
+    expect(setIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it("queryChanged reads the latest sort model", async () => {
+    const setIntent = vi.fn().mockResolvedValue({
+      connectionId: "connection-1",
+      updated: true,
+    });
+    const params = makeViewportParams();
+    params.api.getColumnState = () => ([
+      {
+        colId: "updatedAt",
+        sort: "desc",
+        sortIndex: 0,
+      },
+    ] as Array<ColumnState>);
+
+    const datasource = createSqliteViewportDatasource({
+      storeId: "stocks",
+      openViewportChannel: () => ({
+        connectionId: "connection-1",
+        updates: Stream.empty,
+        setIntent,
+        close: vi.fn().mockResolvedValue({
+          connectionId: "connection-1",
+          closed: true,
         }),
-      }, {
-        storeId: "store-1",
-        runtime,
-      });
+      }),
+    }, {});
 
-      datasource.init(makeViewportParams());
-      yield* Effect.promise(() => Promise.resolve());
-      const baselineCalls = replace.mock.calls.length;
-      datasource.refreshQuery();
-      yield* Effect.promise(() => Promise.resolve());
-      yield* Effect.promise(() => Promise.resolve());
+    datasource.init(params);
+    setIntent.mockClear();
+    datasource.queryChanged();
+    await Promise.resolve();
 
-      yield* Effect.sync(() => {
-        expect(replace).toHaveBeenCalledTimes(baselineCalls + 1);
-      });
-    }),
-  );
+    expect(setIntent).toHaveBeenLastCalledWith(expect.objectContaining({
+      query: expect.objectContaining({
+        sorts: [
+          {
+            field: "updatedAt",
+            direction: "desc",
+          },
+        ],
+      }),
+    }));
+  });
 
-  effect("debounces query refresh when requested", () =>
-    Effect.gen(function* () {
-      const runtime = yield* Effect.runtime<never>();
-      const replace = vi.fn().mockResolvedValue({
-        sessionId: "session-1",
-        replaced: true,
-      });
-      const datasource = createSqliteViewportDatasource({
-        openViewportSession: () => ({
-          sessionId: "session-1",
-          updates: Stream.empty,
-          replace,
-          close: vi.fn().mockResolvedValue({
-            sessionId: "session-1",
-            closed: true,
-          }),
+  it("queryChanged waits until the next microtask to read grid state", async () => {
+    const setIntent = vi.fn().mockResolvedValue({
+      connectionId: "connection-1",
+      updated: true,
+    });
+    let sorted = false;
+    const params = makeViewportParams();
+    params.api.getColumnState = () =>
+      sorted
+        ? ([
+            {
+              colId: "updatedAt",
+              sort: "desc",
+              sortIndex: 0,
+            },
+          ] as Array<ColumnState>)
+        : ([] as Array<ColumnState>);
+
+    const datasource = createSqliteViewportDatasource({
+      storeId: "stocks",
+      openViewportChannel: () => ({
+        connectionId: "connection-1",
+        updates: Stream.empty,
+        setIntent,
+        close: vi.fn().mockResolvedValue({
+          connectionId: "connection-1",
+          closed: true,
         }),
-      }, {
-        storeId: "store-1",
-        runtime,
-      });
+      }),
+    }, {});
 
-      datasource.init(makeViewportParams());
-      yield* Effect.promise(() => Promise.resolve());
-      const baselineCalls = replace.mock.calls.length;
-      datasource.refreshQuery({ debounce: true });
-      datasource.refreshQuery({ debounce: true });
+    datasource.init(params);
+    setIntent.mockClear();
 
-      expect(replace).toHaveBeenCalledTimes(baselineCalls);
+    datasource.queryChanged();
+    sorted = true;
 
-      yield* TestClock.adjust(Duration.millis(200));
-      yield* Effect.promise(() => Promise.resolve());
-      yield* Effect.promise(() => Promise.resolve());
-      yield* Effect.sync(() => {
-        expect(replace).toHaveBeenCalledTimes(baselineCalls + 1);
-      });
-    }),
-  );
+    await Promise.resolve();
 
-  effect("ignores non-numeric viewport ranges during startup", () =>
-    Effect.gen(function* () {
-      const runtime = yield* Effect.runtime<never>();
-      const replace = vi.fn().mockResolvedValue({
-        sessionId: "session-1",
-        replaced: true,
-      });
-      const datasource = createSqliteViewportDatasource({
-        openViewportSession: () => ({
-          sessionId: "session-1",
-          updates: Stream.empty,
-          replace,
-          close: vi.fn().mockResolvedValue({
-            sessionId: "session-1",
-            closed: true,
-          }),
-        }),
-      }, {
-        storeId: "store-1",
-        runtime,
-      });
+    expect(setIntent).toHaveBeenLastCalledWith(expect.objectContaining({
+      query: expect.objectContaining({
+        sorts: [
+          {
+            field: "updatedAt",
+            direction: "desc",
+          },
+        ],
+      }),
+    }));
+  });
 
-      datasource.init(makeViewportParams());
-      yield* Effect.promise(() => Promise.resolve());
-      yield* Effect.promise(() => Promise.resolve());
-      datasource.setViewportRange(undefined as never, undefined as never);
-      yield* Effect.promise(() => Promise.resolve());
-      yield* Effect.promise(() => Promise.resolve());
+  it("ignores non-numeric viewport ranges", () => {
+    const { datasource, setIntent } = makeDatasource();
 
-      yield* Effect.sync(() => {
-        expect(replace).not.toHaveBeenCalledWith(expect.objectContaining({
-          startRow: undefined,
-        }));
-        expect(replace).not.toHaveBeenCalledWith(expect.objectContaining({
-          endRow: undefined,
-        }));
-      });
-    }),
-  );
+    datasource.init(makeViewportParams());
+    setIntent.mockClear();
+
+    datasource.setViewportRange(undefined as never, undefined as never);
+
+    expect(setIntent).not.toHaveBeenCalled();
+  });
+
+  it("closes the single worker channel on destroy", () => {
+    const { close, datasource } = makeDatasource();
+
+    datasource.init(makeViewportParams());
+    datasource.destroy?.();
+
+    expect(close).toHaveBeenCalledTimes(1);
+  });
 });

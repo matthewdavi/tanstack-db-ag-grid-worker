@@ -1,16 +1,10 @@
+import type { GridApi } from "ag-grid-community";
 import type {
-  GridApi,
-  IViewportDatasource,
-} from "ag-grid-community";
-import type { AgGridSqliteClient } from "@sandbox/sqlite-store";
+  AgGridSqliteClient,
+  SqliteViewportDatasource,
+} from "@sandbox/sqlite-store";
 
 import type { MarketRow } from "../../market-sqlite-store";
-
-export interface WorkerMetrics {
-  lastCommitDurationMs: number | null;
-  lastCommitChangeCount: number;
-  totalCommitCount: number;
-}
 
 export interface ViewportStateDiagnostics {
   requestedRange: {
@@ -21,10 +15,8 @@ export interface ViewportStateDiagnostics {
     startRow: number;
     endRow: number;
   } | null;
-  requestVersion: number;
   isLoading: boolean;
   lastPatchLatencyMs: number | null;
-  ignoredPatchCount: number;
   patchCount: number;
 }
 
@@ -32,18 +24,14 @@ export interface ViewportSnapshot {
   startRow: number;
   endRow: number;
   rowCount: number;
-  metrics: WorkerMetrics;
 }
 
-export interface ViewportDatasourceLike extends IViewportDatasource {
-  refreshQuery(options?: {
-    debounce?: boolean;
-  }): void;
-}
+export type ViewportDatasourceLike = SqliteViewportDatasource;
 
 export interface ViewportDatasourceClient {
   readonly storeId: string;
-  viewportDatasource(options?: {
+  open(options?: {
+    throttleMs?: number;
     onSnapshot?: (snapshot: ViewportSnapshot) => void;
     onViewportDiagnostics?: (diagnostics: ViewportStateDiagnostics) => void;
   }): ViewportDatasourceLike;
@@ -54,14 +42,6 @@ export type SqliteViewportClient = AgGridSqliteClient<MarketRow> & {
   setStressRate(rowsPerSecond: number): void;
 };
 
-export function createInitialMetrics(): WorkerMetrics {
-  return {
-    lastCommitDurationMs: null,
-    lastCommitChangeCount: 0,
-    totalCommitCount: 0,
-  };
-}
-
 export function createInitialViewportDiagnostics(): ViewportStateDiagnostics {
   return {
     requestedRange: {
@@ -69,10 +49,8 @@ export function createInitialViewportDiagnostics(): ViewportStateDiagnostics {
       endRow: 50,
     },
     fulfilledRange: null,
-    requestVersion: 0,
     isLoading: true,
     lastPatchLatencyMs: null,
-    ignoredPatchCount: 0,
     patchCount: 0,
   };
 }

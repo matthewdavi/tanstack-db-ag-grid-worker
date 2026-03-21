@@ -10,13 +10,13 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@effect/platform": "^0.94.5",
-    "@effect/platform-browser": "^0.74.0",
+    "@effect/platform-browser": "4.0.0-beta.36",
+    "@effect/sql-sqlite-wasm": "4.0.0-beta.36",
+    "@effect/wa-sqlite": "0.1.2",
     "@faker-js/faker": "^9.9.0",
     "@sandbox/ag-grid-translator": "workspace:*",
-    "@sqlite.org/sqlite-wasm": "^3.51.2-build8",
     "ag-grid-community": "^35.1.0",
     "drizzle-orm": "^0.44.5",
-    "effect": "^3.19.19"
+    "effect": "4.0.0-beta.36"
   }
 }

@@ -1,110 +1,46 @@
 import * as Effect from "effect/Effect";
-import * as Runtime from "effect/Runtime";
+import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import type { SqliteRow, SqliteStoreDefinition } from "./store-config";
-import { StoreRegistry } from "./store-registry";
-import { launchSqliteBrowserWorker } from "./worker-handlers";
-import type {
-  ApplyTransactionSuccess,
-  LoadStoreSuccess,
-} from "./worker-contract";
+import {
+  makeSqliteViewportChannelService,
+  SqliteViewportChannelService,
+} from "./store-registry";
+import { makeSqliteWorkerLayer } from "./worker-handlers";
 
-export interface SqliteWorkerRuntimeOptions {
+export interface SqliteWorkerServiceOptions {
   storeId: string;
-  runtime?: Runtime.Runtime<never>;
-  writeRefreshThrottleMs?: number;
 }
 
-export class SqliteWorkerRuntime<TRow extends SqliteRow = SqliteRow> {
+export interface SqliteWorkerService {
   readonly storeId: string;
-  private readonly runtime: Runtime.Runtime<never>;
-  private readonly registry: StoreRegistry<TRow>;
-  private ready = false;
+  readonly serve: Effect.Effect<never, unknown, never>;
+  readonly invalidate: Effect.Effect<void>;
+  readonly close: Effect.Effect<void>;
+}
 
-  constructor(
-    private readonly store: SqliteStoreDefinition<object, TRow>,
-    options: SqliteWorkerRuntimeOptions,
-  ) {
-    this.storeId = options.storeId;
-    this.runtime = options.runtime ?? Runtime.defaultRuntime;
-    this.registry = new StoreRegistry(store, {
-      runtime: this.runtime,
-      writeRefreshThrottleMs: options.writeRefreshThrottleMs,
+export function makeSqliteWorkerService<TRow extends SqliteRow = SqliteRow>(
+  store: SqliteStoreDefinition<object, TRow>,
+  options: SqliteWorkerServiceOptions,
+): Effect.Effect<SqliteWorkerService, never, SqlClient.SqlClient> {
+  return Effect.gen(function* () {
+    const channelService = yield* makeSqliteViewportChannelService(store, {
+      storeId: options.storeId,
     });
-  }
-
-  replaceAll(rows: ReadonlyArray<TRow>): Promise<LoadStoreSuccess> {
-    return this.runPromise(Effect.tryPromise({
-      try: async () => {
-        if (this.ready) {
-          this.registry.disposeStore(this.storeId);
-        }
-        const result = await this.registry.loadStore(
-          { storeId: this.storeId },
-          { kind: "rows", rows },
-        );
-        this.ready = true;
-        return result;
-      },
-      catch: (error) => error instanceof Error ? error : new Error("Failed to replace rows"),
-    }));
-  }
-
-  upsert(rows: ReadonlyArray<TRow>): Promise<ApplyTransactionSuccess> {
-    return this.runPromise(Effect.tryPromise({
-      try: async () => {
-        await this.ensureLoaded();
-        return this.registry.applyTransaction(this.storeId, {
-          kind: "upsert",
-          rows,
-        });
-      },
-      catch: (error) => error instanceof Error ? error : new Error("Failed to upsert rows"),
-    }));
-  }
-
-  delete(ids: ReadonlyArray<string | number>): Promise<ApplyTransactionSuccess> {
-    return this.runPromise(Effect.tryPromise({
-      try: async () => {
-        await this.ensureLoaded();
-        return this.registry.applyTransaction(this.storeId, {
-          kind: "delete",
-          ids,
-        });
-      },
-      catch: (error) => error instanceof Error ? error : new Error("Failed to delete rows"),
-    }));
-  }
-
-  async setStressRate(rowsPerSecond: number) {
-    await this.ensureLoaded();
-    return this.registry.setStressRate(this.storeId, rowsPerSecond);
-  }
-
-  serve() {
-    return Effect.gen(this, function* () {
-      yield* Effect.promise(() => this.ensureLoaded());
-      yield* launchSqliteBrowserWorker(this.registry);
-    });
-  }
-
-  launchBrowserWorker() {
-    return this.serve();
-  }
-
-  private async ensureLoaded() {
-    if (this.ready) {
-      return;
-    }
-
-    await this.registry.loadStore(
-      { storeId: this.storeId },
-      { kind: "rows", rows: [] },
+    const serviceLayer = Layer.succeed(
+      SqliteViewportChannelService,
+      channelService,
     );
-    this.ready = true;
-  }
+    const workerLayer = makeSqliteWorkerLayer().pipe(
+      Layer.provide(serviceLayer),
+    );
 
-  private runPromise<A, E>(effect: Effect.Effect<A, E, never>) {
-    return Runtime.runPromise(this.runtime)(effect);
-  }
+    return {
+      storeId: options.storeId,
+      serve: Layer.launch(workerLayer) as Effect.Effect<never, unknown, never>,
+      invalidate: channelService.invalidate,
+      close: channelService.closeAll,
+    } satisfies SqliteWorkerService;
+  });
 }

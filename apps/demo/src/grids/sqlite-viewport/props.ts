@@ -51,7 +51,6 @@ export function getSqliteViewportGridModel(client: DemoSqliteClient) {
       statusBar: createRowCountStatusBar(
         "SQLite rows",
         controller.store.getSnapshot().context.rowCount,
-        controller.store.getSnapshot().context.metrics,
       ),
     } satisfies AgGridReactProps<MarketRow>,
   };

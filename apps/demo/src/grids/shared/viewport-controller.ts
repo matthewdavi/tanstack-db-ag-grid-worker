@@ -1,14 +1,9 @@
 import { createStore } from "@xstate/store";
 import type { Subscription } from "@xstate/store";
-import type {
-  FilterChangedEvent,
-  GridApi,
-  GridReadyEvent,
-} from "ag-grid-community";
+import type { GridApi, GridReadyEvent } from "ag-grid-community";
 
 import type { MarketRow } from "../../market-sqlite-store";
 import {
-  createInitialMetrics,
   createInitialViewportDiagnostics,
   setGridLoading,
   type ViewportDatasourceClient,
@@ -23,7 +18,6 @@ interface CreateViewportGridControllerOptions {
       startRow: number;
       endRow: number;
       rowCount: number;
-      metrics: ReturnType<typeof createInitialMetrics>;
     }) => void;
     onViewportDiagnostics: (diagnostics: ReturnType<typeof createInitialViewportDiagnostics>) => void;
   }) => ViewportDatasourceLike;
@@ -38,12 +32,6 @@ export function createViewportGridController(
   let api: GridApi<MarketRow> | null = null;
   let datasource: ViewportDatasourceLike | null = null;
   let subscription: Subscription | null = null;
-
-  const refreshQuery = (queryOptions?: {
-    debounce?: boolean;
-  }) => {
-    datasource?.refreshQuery(queryOptions);
-  };
 
   const cleanup = () => {
     subscription?.unsubscribe();
@@ -64,7 +52,7 @@ export function createViewportGridController(
             store.trigger.diagnostics({ diagnostics });
           },
         })
-      : options.datasourceClient.viewportDatasource({
+      : options.datasourceClient.open({
           onSnapshot(snapshot) {
             store.trigger.snapshot({ snapshot });
           },
@@ -84,19 +72,16 @@ export function createViewportGridController(
     context: {
       rowsPerSecond: 0,
       rowCount: 0,
-      metrics: createInitialMetrics(),
       diagnostics: createInitialViewportDiagnostics(),
     },
     on: {
       snapshot: (context, event: {
         snapshot: {
           rowCount: number;
-          metrics: ReturnType<typeof createInitialMetrics>;
         };
       }) => ({
         ...context,
         rowCount: event.snapshot.rowCount,
-        metrics: event.snapshot.metrics,
       }),
       diagnostics: (context, event: {
         diagnostics: ReturnType<typeof createInitialViewportDiagnostics>;
@@ -104,15 +89,6 @@ export function createViewportGridController(
         ...context,
         diagnostics: event.diagnostics,
       }),
-      refreshRequested: (context, event: { debounce?: boolean }, enqueue) => {
-        enqueue.effect(() => {
-          refreshQuery({
-            debounce: event.debounce,
-          });
-        });
-
-        return context;
-      },
       pushLiveUpdateRequested: (context, _event, enqueue) => {
         enqueue.effect(() => {
           options.onPushLiveUpdate?.();
@@ -157,13 +133,11 @@ export function createViewportGridController(
       });
       event.api.addEventListener("gridPreDestroyed", cleanup);
     },
-    onFilterChanged(event: FilterChangedEvent<MarketRow>) {
-      store.trigger.refreshRequested({
-        debounce: event.afterFloatingFilter === true,
-      });
+    onFilterChanged() {
+      datasource?.queryChanged?.();
     },
     onSortChanged() {
-      store.trigger.refreshRequested({});
+      datasource?.queryChanged?.();
     },
     onPushLiveUpdate: options.onPushLiveUpdate
       ? () => {

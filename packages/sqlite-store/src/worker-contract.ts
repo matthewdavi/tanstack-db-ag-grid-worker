@@ -1,130 +1,19 @@
 import { Schema } from "effect";
+import * as Rpc from "effect/unstable/rpc/Rpc";
+import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
-import { GridQueryStateSchema } from "@sandbox/ag-grid-translator";
+import {
+  GridQueryStateSchema,
+  type GridQueryState,
+} from "@sandbox/ag-grid-translator";
 
-import type { GridQueryState } from "@sandbox/ag-grid-translator";
 import type { SqliteRow } from "./store-config";
 
-const RowPayloadSchema = Schema.Unknown;
-const RowKeyValueSchema = Schema.Union(Schema.String, Schema.Number);
-
-const StoreMetricsSchema = Schema.Struct({
-  lastCommitDurationMs: Schema.NullOr(Schema.Number),
-  lastCommitChangeCount: Schema.Number,
-  totalCommitCount: Schema.Number,
-}) as Schema.Schema<StoreMetrics>;
-
-export const OpenViewportSessionRequestSchema = Schema.Struct({
-  sessionId: Schema.String,
-  storeId: Schema.String,
-  startRow: Schema.Number,
-  endRow: Schema.Number,
-  query: GridQueryStateSchema,
-}) as Schema.Schema<OpenViewportSessionRequest>;
-
-export const ReplaceViewportSessionRequestSchema = Schema.Struct({
-  sessionId: Schema.String,
-  startRow: Schema.Number,
-  endRow: Schema.Number,
-  query: GridQueryStateSchema,
-}) as Schema.Schema<ReplaceViewportSessionRequest>;
-
-export const CloseViewportSessionRequestSchema = Schema.Struct({
-  sessionId: Schema.String,
-}) as Schema.Schema<CloseViewportSessionRequest>;
-
-export const ViewportPatchSchema = Schema.Struct({
-  storeId: Schema.String,
-  startRow: Schema.Number,
-  endRow: Schema.Number,
-  rowCount: Schema.Number,
-  latencyMs: Schema.Number,
-  metrics: StoreMetricsSchema,
-  rows: Schema.Array(RowPayloadSchema),
-}) as Schema.Schema<ViewportPatch>;
-
-const ReplaceViewportSessionSuccessSchema = Schema.Struct({
-  sessionId: Schema.String,
-  replaced: Schema.Boolean,
-}) as Schema.Schema<ReplaceViewportSessionSuccess>;
-
-const CloseViewportSessionSuccessSchema = Schema.Struct({
-  sessionId: Schema.String,
-  closed: Schema.Boolean,
-}) as Schema.Schema<CloseViewportSessionSuccess>;
-
-export class OpenViewportSession extends Schema.TaggedRequest<OpenViewportSession>("OpenViewportSession")("OpenViewportSession", {
-  failure: Schema.String,
-  success: ViewportPatchSchema,
-  payload: {
-    sessionId: Schema.String,
-    storeId: Schema.String,
-    startRow: Schema.Number,
-    endRow: Schema.Number,
-    query: GridQueryStateSchema,
-  },
-}) {}
-
-export class ReplaceViewportSession extends Schema.TaggedRequest<ReplaceViewportSession>("ReplaceViewportSession")("ReplaceViewportSession", {
-  failure: Schema.String,
-  success: ReplaceViewportSessionSuccessSchema,
-  payload: {
-    sessionId: Schema.String,
-    startRow: Schema.Number,
-    endRow: Schema.Number,
-    query: GridQueryStateSchema,
-  },
-}) {}
-
-export class CloseViewportSession extends Schema.TaggedRequest<CloseViewportSession>("CloseViewportSession")("CloseViewportSession", {
-  failure: Schema.String,
-  success: CloseViewportSessionSuccessSchema,
-  payload: {
-    sessionId: Schema.String,
-  },
-}) {}
-
-export const WorkerRequestSchema = Schema.Union(
-  OpenViewportSession,
-  ReplaceViewportSession,
-  CloseViewportSession,
-);
-
-export type WorkerRequest = typeof WorkerRequestSchema.Type;
-
-export interface StoreDefinition {
-  storeId: string;
-  rowKey?: string | null;
-}
-
-export type StoreSource<TRow extends SqliteRow = SqliteRow> =
-  | {
-      kind: "rows";
-      rows: ReadonlyArray<TRow>;
-    }
-  | {
-      kind: "generator";
-      rowCount: number;
-      seed?: number | null;
-    };
-
-export interface OpenViewportSessionRequest {
-  sessionId: string;
+export interface ViewportIntent {
   storeId: string;
   startRow: number;
   endRow: number;
   query: GridQueryState;
-}
-
-export interface ReplaceViewportSessionRequest {
-  sessionId: string;
-  startRow: number;
-  endRow: number;
-  query: GridQueryState;
-}
-
-export interface CloseViewportSessionRequest {
-  sessionId: string;
 }
 
 export interface ViewportPatch<TRow extends SqliteRow = SqliteRow> {
@@ -133,57 +22,75 @@ export interface ViewportPatch<TRow extends SqliteRow = SqliteRow> {
   endRow: number;
   rowCount: number;
   latencyMs: number;
-  metrics: StoreMetrics;
   rows: ReadonlyArray<TRow>;
 }
 
-export type StoreTransaction<TRow extends SqliteRow = SqliteRow> =
-  | {
-      kind: "upsert";
-      rows: ReadonlyArray<TRow>;
-    }
-  | {
-      kind: "delete";
-      ids: ReadonlyArray<string | number>;
-    };
-
-export interface LoadStoreSuccess {
-  storeId: string;
-  rowCount: number;
-  metrics: StoreMetrics;
+export interface SetViewportIntentSuccess {
+  connectionId: string;
+  updated: boolean;
 }
 
-export interface ApplyTransactionSuccess {
-  storeId: string;
-  rowCount: number;
-  metrics: StoreMetrics;
-}
-
-export interface DisposeStoreSuccess {
-  storeId: string;
-  disposed: boolean;
-}
-
-export interface ReplaceViewportSessionSuccess {
-  sessionId: string;
-  replaced: boolean;
-}
-
-export interface CloseViewportSessionSuccess {
-  sessionId: string;
+export interface CloseViewportChannelSuccess {
+  connectionId: string;
   closed: boolean;
 }
 
-export interface StressState {
-  storeId: string;
-  rowsPerSecond: number;
-  running: boolean;
-  rowCount: number;
-  metrics: StoreMetrics;
-}
+export const ViewportIntentSchema = Schema.Struct({
+  storeId: Schema.String,
+  startRow: Schema.Number,
+  endRow: Schema.Number,
+  query: GridQueryStateSchema,
+}) as unknown as Schema.Schema<ViewportIntent>;
 
-export interface StoreMetrics {
-  lastCommitDurationMs: number | null;
-  lastCommitChangeCount: number;
-  totalCommitCount: number;
-}
+export const ViewportPatchSchema = Schema.Struct({
+  storeId: Schema.String,
+  startRow: Schema.Number,
+  endRow: Schema.Number,
+  rowCount: Schema.Number,
+  latencyMs: Schema.Number,
+  rows: Schema.Array(Schema.Unknown),
+}) as unknown as Schema.Schema<ViewportPatch>;
+
+const SetViewportIntentSuccessSchema = Schema.Struct({
+  connectionId: Schema.String,
+  updated: Schema.Boolean,
+}) as Schema.Schema<SetViewportIntentSuccess>;
+
+const CloseViewportChannelSuccessSchema = Schema.Struct({
+  connectionId: Schema.String,
+  closed: Schema.Boolean,
+}) as Schema.Schema<CloseViewportChannelSuccess>;
+
+export class ConnectViewportChannel extends Rpc.make("ConnectViewportChannel", {
+  payload: {
+    connectionId: Schema.String,
+    intent: ViewportIntentSchema,
+    throttleMs: Schema.Number,
+  },
+  success: ViewportPatchSchema,
+  error: Schema.String,
+  stream: true,
+}) {}
+
+export class SetViewportIntent extends Rpc.make("SetViewportIntent", {
+  payload: {
+    connectionId: Schema.String,
+    intent: ViewportIntentSchema,
+  },
+  success: SetViewportIntentSuccessSchema,
+  error: Schema.String,
+}) {}
+
+export class CloseViewportChannel extends Rpc.make("CloseViewportChannel", {
+  payload: {
+    connectionId: Schema.String,
+  },
+  success: CloseViewportChannelSuccessSchema,
+  error: Schema.String,
+}) {}
+
+export const ViewportChannelRpcs = RpcGroup.make(
+  ConnectViewportChannel,
+  SetViewportIntent,
+  CloseViewportChannel,
+);

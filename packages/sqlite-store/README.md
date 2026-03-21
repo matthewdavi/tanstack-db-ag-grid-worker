@@ -1,34 +1,44 @@
 # `@sandbox/sqlite-store`
 
-`@sandbox/sqlite-store` is an AG Grid-first SQLite Wasm worker engine.
+`@sandbox/sqlite-store` is the query engine.
 
-It is built for the viewport row model:
+it takes ag grid viewport requests, turns them into sqlite sql, runs that inside a worker, and pushes the current visible window back to the grid.
 
-- define one Drizzle SQLite table
-- infer the row type once from that table
-- run count + window SQL inside a worker
-- keep the main thread read-only
-- coalesce write-driven refreshes in the worker
+the important boundary is:
 
-This package is intentionally not a generic database client and not a live-query engine.
+- your worker creates and owns sqlite
+- your app code does writes however it wants
+- this package serves ag grid queries against that sqlite dependency
+- writes do not leak into the public api
 
-## API
+## what it does
 
-The public API is deliberately small:
+- translates ag grid filter/sort state into `GridQueryState`
+- plans `count(*)` + visible window sql
+- keeps one worker-owned current viewport channel per grid
+- reruns the current viewport query when the worker invalidates it
+- throttles invalidation reruns in the worker with `throttleMs`
+
+it is intentionally not:
+
+- a generic sqlite client
+- a generic live-query framework
+- a browser-side write api
+
+## public api
 
 - `defineAgGridSqliteEngine(...)`
-- `engine.createWorkerRuntime(...)`
+- `engine.makeWorkerService(...)`
 - `engine.connect(...)`
+- browser client: `open(options?)` and `close()`
 
-The main thread should only connect and hand the returned datasource to AG Grid.
-
-## Define An Engine
+## define the engine
 
 ```ts
 import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { defineAgGridSqliteEngine } from "@sandbox/sqlite-store";
 
-export const marketRowsTable = sqliteTable("market_rows", {
+const marketRowsTable = sqliteTable("market_rows", {
   id: text("id").primaryKey(),
   active: integer("active", { mode: "boolean" }).notNull(),
   symbol: text("symbol").notNull(),
@@ -45,54 +55,39 @@ export const marketGrid = defineAgGridSqliteEngine({
 });
 ```
 
-That single Drizzle table drives:
+## worker side
 
-- the row type
-- table name
-- SQL column mapping
-- create-table DDL
-- upsert SQL
-- delete-by-key SQL
-- fallback sort key
-
-## Worker Runtime
-
-Writes and ingestion live in the worker runtime, not in the browser API.
+the worker provides sqlite. this package depends on that effect service and serves viewport queries on top of it.
 
 ```ts
 import * as Effect from "effect/Effect";
-import { marketGrid } from "./market-sqlite-store";
+import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient";
 
-const runtime = marketGrid.createWorkerRuntime({
-  storeId: "market",
-});
+const sqlRuntime = ManagedRuntime.make(SqliteClient.layerMemory({}));
+
+const workerService = await sqlRuntime.runPromise(
+  marketGrid.makeWorkerService({
+    storeId: "market",
+  }),
+);
 
 Effect.runFork(
   Effect.gen(function* () {
-    yield* Effect.promise(() => runtime.replaceAll(seedRows));
-    yield* runtime.serve();
+    yield* workerService.serve;
   }),
 );
 ```
 
-Worker runtime methods:
+worker service surface:
 
-- `replaceAll(rows)`
-- `upsert(rows)`
-- `delete(ids)`
-- `setStressRate(rowsPerSecond)` for demo-style worker-owned write churn
-- `serve()`
+- `serve`
+- `invalidate`
+- `close`
 
-The worker runtime owns:
+if your worker writes to sqlite, your worker should call `invalidate` after those writes.
 
-- SQLite DB creation
-- table bootstrap
-- row writes
-- viewport session refresh scheduling
-
-## Main Thread
-
-The browser side is read-only.
+## browser side
 
 ```ts
 const market = await marketGrid.connect(
@@ -100,9 +95,10 @@ const market = await marketGrid.connect(
   { storeId: "market" },
 );
 
-const datasource = market.viewportDatasource({
+const datasource = market.open({
+  throttleMs: 100,
   onSnapshot(snapshot) {
-    console.log(snapshot.rowCount, snapshot.metrics);
+    console.log(snapshot.rowCount);
   },
   onViewportDiagnostics(diagnostics) {
     console.log(diagnostics);
@@ -110,76 +106,50 @@ const datasource = market.viewportDatasource({
 });
 ```
 
-Main-thread surface:
+browser client surface:
 
-- `viewportDatasource(options?)`
+- `open(options?)`
 - `close()`
 
-It does not expose:
+`open()` returns the `IViewportDatasource` you hand to ag grid.
 
-- `loadStore`
-- `applyTransaction`
-- `collection(...)`
-- `openViewportSession(...)`
+## ag grid usage
 
-Those are internal worker concerns.
-
-## AG Grid Usage
-
-```ts
+```tsx
 <AgGridReact<Row>
   rowModelType="viewport"
-  viewportDatasource={market.viewportDatasource()}
+  viewportDatasource={market.open({ throttleMs: 100 })}
   getRowId={(params) => String(params.data.id)}
 />
 ```
 
-The datasource behavior is simple:
+the browser side stays thin:
 
-- initial open runs `count + rows`
-- sort changes rerun immediately
-- filter changes rerun immediately
-- floating-filter typing can debounce
-- write churn triggers one coalesced rerun per throttle window
+- open one worker channel
+- send the latest viewport intent immediately
+- let the worker own throttling and invalidation reruns
+- close the channel on destroy
+
+there is no browser-side debounce or browser-side write api.
+
+## invalidation model
+
+the worker owns the current viewport intent.
+
+when the app writes to sqlite, the app publishes invalidation by calling `workerService.invalidate`.
+
+the worker then reruns:
+
+- `count(*)`
+- the current visible window query
+
+that rerun is throttled in the worker with `throttleMs`, so continuous writes do not spam the grid.
+
+## design constraints
+
+- ag grid viewport row model is the target
+- sqlite is created in the worker, not in the browser
+- the package depends on sqlite as an effect service
+- writes are app-local and outside the package boundary
 - every patch is a full visible window plus row count
-
-There is no incremental diff protocol.
-
-## Worker-Owned Demo Controls
-
-If an app wants demo-only write controls such as stress sliders or “push live update”, keep that bridge app-local.
-
-For example:
-
-- create the worker in app code
-- call `engine.connect(() => worker, { storeId })`
-- send app-specific `postMessage(...)` commands to the worker
-- let the worker file call `runtime.upsert(...)` or `runtime.setStressRate(...)`
-
-That keeps the package API read-only while still allowing app-local mutation demos.
-
-## Query Model
-
-`sqlite-store` expects `GridQueryState` from `@sandbox/ag-grid-translator`.
-
-The worker planner translates that to SQLite SQL with positional `?` params:
-
-- supported AG Grid filter operators
-- nested `and` / `or`
-- dynamic `ORDER BY`
-- `LIMIT` / `OFFSET`
-- stable fallback ordering via `rowKey`
-
-Drizzle is used for schema and type inference, not for the runtime viewport query builder.
-
-## Design Constraints
-
-- AG Grid viewport row model is the primary use case
-- main-thread API is read-only
-- no live-query subscription graph
-- no incremental patch engine
-- no secondary indexes by default
-- no persistence by default
-- no `Effect/sql` adapter in v1
-
-The package favors a small API and fast rerun queries over a more elaborate abstraction layer.
+- no incremental diff protocol

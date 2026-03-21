@@ -101,6 +101,5 @@ export const marketGrid = defineAgGridSqliteEngine({
   rowKey: "id",
   rowFactory: {
     generateRows: generateMarketRows,
-    createStressRowFactory: createMarketRowFactory,
   },
 });

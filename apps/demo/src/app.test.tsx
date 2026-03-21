@@ -37,11 +37,6 @@ const sampleRows: ReadonlyArray<MarketRow> = [
   },
 ];
 
-const sampleMetrics = {
-  lastCommitDurationMs: 1.75,
-  lastCommitChangeCount: sampleRows.length,
-  totalCommitCount: 1,
-};
 const originalConsoleError = console.error.bind(console);
 const originalConsoleWarn = console.warn.bind(console);
 
@@ -109,20 +104,17 @@ function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
 } {
   return {
     storeId: "sqlite-olympic-athletes",
-    viewportDatasource: vi.fn().mockImplementation((options?: {
+    open: vi.fn().mockImplementation((options?: {
       onSnapshot?: (snapshot: {
         startRow: number;
         endRow: number;
         rowCount: number;
-        metrics: typeof sampleMetrics;
       }) => void;
       onViewportDiagnostics?: (diagnostics: {
         requestedRange: { startRow: number; endRow: number };
         fulfilledRange: { startRow: number; endRow: number } | null;
-        requestVersion: number;
         isLoading: boolean;
         lastPatchLatencyMs: number | null;
-        ignoredPatchCount: number;
         patchCount: number;
       }) => void;
     }) => ({
@@ -134,15 +126,12 @@ function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
           startRow: 0,
           endRow: sampleRows.length,
           rowCount: sampleRows.length,
-          metrics: sampleMetrics,
         });
         options?.onViewportDiagnostics?.({
           requestedRange: { startRow: 0, endRow: 50 },
           fulfilledRange: { startRow: 0, endRow: sampleRows.length },
-          requestVersion: 1,
           isLoading: false,
           lastPatchLatencyMs: 8.5,
-          ignoredPatchCount: 0,
           patchCount: 1,
         });
         params.setRowCount(sampleRows.length);
@@ -151,7 +140,6 @@ function makeSqliteClient(): AgGridSqliteClient<MarketRow> & {
         );
       },
       setViewportRange: vi.fn(),
-      refreshQuery: vi.fn(),
       destroy: vi.fn(),
     })),
     pushLiveUpdate: vi.fn(),
@@ -173,13 +161,11 @@ describe("demo app", () => {
     await screen.findAllByText("Ada Insights Holdings");
 
     await waitFor(() => {
-      expect(sqliteClient.viewportDatasource).toHaveBeenCalled();
+      expect(sqliteClient.open).toHaveBeenCalled();
     });
 
     await screen.findAllByText(/rows$/);
     await screen.findAllByText("2");
-    await screen.findAllByText("Last commit");
-    await screen.findAllByText("1.75 ms / 2 rows");
     await screen.findAllByText("Requested range");
     await screen.findAllByText("Fulfilled range");
     await screen.findAllByText("Patch latency");

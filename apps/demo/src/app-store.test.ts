@@ -6,7 +6,7 @@ import type { DemoSqliteClient } from "./browser-clients";
 function makeSqliteClient(): DemoSqliteClient {
   return {
     storeId: "sqlite-olympic-athletes",
-    viewportDatasource: vi.fn(),
+    open: vi.fn(),
     pushLiveUpdate: vi.fn(),
     setStressRate: vi.fn(),
     close: vi.fn().mockResolvedValue(undefined),

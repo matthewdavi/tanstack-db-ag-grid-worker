@@ -1,48 +1,33 @@
-import * as Effect from "effect/Effect";
-
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner";
-import * as WorkerRunner from "@effect/platform/WorkerRunner";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as RpcServer from "effect/unstable/rpc/RpcServer";
 
-import type { SqliteRow } from "./store-config";
-import { StoreRegistry } from "./store-registry";
-import {
-  CloseViewportSession,
-  OpenViewportSession,
-  ReplaceViewportSession,
-  type WorkerRequest,
-  WorkerRequestSchema,
-} from "./worker-contract";
+import { SqliteViewportChannelService } from "./store-registry";
+import { ViewportChannelRpcs } from "./worker-contract";
 
-export function createSqliteWorkerHandlers<TRow extends SqliteRow = SqliteRow>(
-  registry: StoreRegistry<TRow>,
-) {
-  return {
-    OpenViewportSession: (request: OpenViewportSession) =>
-      registry.openViewportSession(request),
-    ReplaceViewportSession: (request: ReplaceViewportSession) =>
-      registry.replaceViewportSession(request),
-    CloseViewportSession: (request: CloseViewportSession) =>
-      Effect.tryPromise({
-        try: () => registry.closeViewportSession(request.sessionId),
-        catch: (error) =>
-          error instanceof Error ? error.message : "Failed to close viewport session",
-      }),
-  } satisfies WorkerRunner.SerializedRunner.Handlers<WorkerRequest>;
-}
+export const SqliteViewportRpcLive = ViewportChannelRpcs.toLayer(
+  Effect.gen(function* () {
+    const service = yield* SqliteViewportChannelService;
 
-export function makeSqliteWorkerLayer<TRow extends SqliteRow = SqliteRow>(
-  registry: StoreRegistry<TRow>,
-) {
-  return WorkerRunner.layerSerialized(
-    WorkerRequestSchema,
-    createSqliteWorkerHandlers(registry),
+    return ViewportChannelRpcs.of({
+      ConnectViewportChannel: (request) =>
+        service.connect(
+          request.connectionId,
+          request.intent,
+          { throttleMs: request.throttleMs },
+        ),
+      SetViewportIntent: (request) =>
+        service.setIntent(request.connectionId, request.intent),
+      CloseViewportChannel: (request) =>
+        service.close(request.connectionId),
+    });
+  }),
+);
+
+export const makeSqliteWorkerLayer = () =>
+  RpcServer.layer(ViewportChannelRpcs).pipe(
+    Layer.provide(SqliteViewportRpcLive),
+    Layer.provide(RpcServer.layerProtocolWorkerRunner),
+    Layer.provide(BrowserWorkerRunner.layer),
   );
-}
-
-export function launchSqliteBrowserWorker<TRow extends SqliteRow = SqliteRow>(
-  registry: StoreRegistry<TRow>,
-) {
-  return BrowserWorkerRunner.launch(makeSqliteWorkerLayer(registry)).pipe(
-    Effect.provide(BrowserWorkerRunner.layer),
-  );
-}

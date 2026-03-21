@@ -1,4 +1,4 @@
-import { Match, Schema } from "effect";
+import { Match } from "effect";
 
 import type {
   GridComparisonPredicate,
@@ -6,11 +6,7 @@ import type {
   GridPredicateGroup,
   GridQueryState,
 } from "./query-state";
-import { GridQueryStateSchema } from "./query-state";
 import {
-  AdvancedFilterModelSchema,
-  GridColumnFilterStateSchema,
-  GridSortStateSchema,
   type AdvancedFilterModel,
   type CombinedDateFilter,
   type CombinedNumberFilter,
@@ -24,17 +20,21 @@ import {
   type TextFilterCondition,
 } from "./schemas";
 
-export const decodeColumnFilterState = Schema.decodeUnknownSync(
-  GridColumnFilterStateSchema,
-);
+export const decodeColumnFilterState = (
+  input: unknown,
+): GridColumnFilterState => input as GridColumnFilterState;
 
-export const decodeAdvancedFilterState = Schema.decodeUnknownSync(
-  AdvancedFilterModelSchema,
-);
+export const decodeAdvancedFilterState = (
+  input: unknown,
+): AdvancedFilterModel => input as AdvancedFilterModel;
 
-export const decodeGridSortState = Schema.decodeUnknownSync(GridSortStateSchema);
+export const decodeGridSortState = (
+  input: unknown,
+): GridSortState => input as GridSortState;
 
-export const decodeGridQueryState = Schema.decodeUnknownSync(GridQueryStateSchema);
+export const decodeGridQueryState = (
+  input: unknown,
+): GridQueryState => input as GridQueryState;
 
 export function isAdvancedFilterModel(
   value: unknown,

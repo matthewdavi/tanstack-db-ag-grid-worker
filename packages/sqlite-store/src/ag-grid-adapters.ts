@@ -1,11 +1,5 @@
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
-import * as Data from "effect/Data";
-import type * as Fiber from "effect/Fiber";
-import * as FiberApi from "effect/Fiber";
-import * as Runtime from "effect/Runtime";
-import * as Scope from "effect/Scope";
+import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 
 import type {
@@ -18,21 +12,18 @@ import type {
 import { translateAgGridQuery } from "@sandbox/ag-grid-translator";
 
 import type { SqliteRow } from "./store-config";
-import type { StoreMetrics } from "./worker-contract";
+import type { ViewportIntent, ViewportPatch } from "./worker-contract";
 import type {
   ReadOnlySqliteWorkerClient,
-  SqliteViewportSessionHandle,
+  SqliteViewportChannelHandle,
 } from "./worker-client";
 
 export interface GridStoreAdapterOptions {
-  storeId: string;
-  queryDebounceMs?: number;
-  runtime?: Runtime.Runtime<never>;
+  throttleMs?: number;
   onSnapshot?: (snapshot: {
     startRow: number;
     endRow: number;
     rowCount: number;
-    metrics: StoreMetrics;
   }) => void;
   onViewportDiagnostics?: (diagnostics: ViewportDiagnostics) => void;
 }
@@ -46,40 +37,17 @@ export interface ViewportDiagnostics {
     startRow: number;
     endRow: number;
   } | null;
-  requestVersion: number;
   isLoading: boolean;
   lastPatchLatencyMs: number | null;
-  ignoredPatchCount: number;
   patchCount: number;
 }
 
+export interface SqliteViewportDatasource extends IViewportDatasource {
+  queryChanged(): void;
+}
+
 const INITIAL_VIEWPORT_ROW_COUNT = 50;
-const DEFAULT_QUERY_DEBOUNCE_MS = 200;
-type ViewportRefreshKind = "range" | "query";
-
-type ViewportDatasourceState =
-  | {
-      readonly _tag: "Idle";
-      readonly version: number;
-    }
-  | {
-      readonly _tag: "Starting";
-      readonly version: number;
-      readonly session: SqliteViewportSessionHandle;
-      readonly startPromise: Promise<void>;
-    }
-  | {
-      readonly _tag: "Live";
-      readonly version: number;
-      readonly session: SqliteViewportSessionHandle;
-      readonly scope: Scope.CloseableScope;
-    }
-  | {
-      readonly _tag: "Destroyed";
-      readonly version: number;
-    };
-
-const ViewportDatasourceState = Data.taggedEnum<ViewportDatasourceState>();
+const DEFAULT_THROTTLE_MS = 100;
 
 function reportViewportError(error: unknown) {
   console.error("[sqlite-viewport]", error);
@@ -122,289 +90,165 @@ function isFiniteRowIndex(value: number) {
   return Number.isFinite(value) && value >= 0;
 }
 
-export interface ViewportDatasourceHandle extends IViewportDatasource {
-  refreshQuery(options?: {
-    debounce?: boolean;
-  }): void;
-}
-
 export function createSqliteViewportDatasource<TData extends SqliteRow = SqliteRow>(
-  collection: Pick<ReadOnlySqliteWorkerClient<TData>, "openViewportSession">,
+  collection: Pick<ReadOnlySqliteWorkerClient<TData>, "storeId" | "openViewportChannel">,
   options: GridStoreAdapterOptions,
-): ViewportDatasourceHandle {
+): SqliteViewportDatasource {
   let params: IViewportDatasourceParams<TData> | null = null;
-  let state: ViewportDatasourceState = ViewportDatasourceState.Idle({
-    version: 0,
-  });
-  let queryRefreshFiber: Fiber.RuntimeFiber<void, unknown> | null = null;
-  let queryRefreshToken = 0;
-  let patchCount = 0;
-  let ignoredPatchCount = 0;
-  let isLoading = true;
-  let lastPatchLatencyMs: number | null = null;
-  const queryDebounceMs = options.queryDebounceMs ?? DEFAULT_QUERY_DEBOUNCE_MS;
-  const runtime = options.runtime ?? Runtime.defaultRuntime;
-  let viewportRange = {
+  let channel: SqliteViewportChannelHandle<TData> | null = null;
+  let updatesFiber: Fiber.Fiber<void, unknown> | null = null;
+  let queryChangeQueued = false;
+  let requestedRange = {
     startRow: 0,
     endRow: INITIAL_VIEWPORT_ROW_COUNT,
   };
-  const readState = (): ViewportDatasourceState => state;
-  const runFork = <A, E>(effect: Effect.Effect<A, E, never>) =>
-    Runtime.runFork(runtime)(effect);
-  const runPromise = <A, E>(effect: Effect.Effect<A, E, never>) =>
-    Runtime.runPromise(runtime)(effect);
-  const clearQueryRefreshFiber = () => {
-    if (queryRefreshFiber === null) {
-      return Promise.resolve();
-    }
-
-    const fiber = queryRefreshFiber;
-    queryRefreshFiber = null;
-    return runPromise(FiberApi.interrupt(fiber));
+  let diagnostics: ViewportDiagnostics = {
+    requestedRange,
+    fulfilledRange: null,
+    isLoading: true,
+    lastPatchLatencyMs: null,
+    patchCount: 0,
   };
 
-  const emitDiagnostics = (
-    fulfilledRange: ViewportDiagnostics["fulfilledRange"] = null,
+  const emitDiagnostics = () => {
+    options.onViewportDiagnostics?.(diagnostics);
+  };
+
+  const updateDiagnostics = (
+    next: Partial<ViewportDiagnostics>,
   ) => {
-    options.onViewportDiagnostics?.({
-      requestedRange: { ...viewportRange },
-      fulfilledRange,
-      requestVersion: state.version,
-      isLoading,
-      lastPatchLatencyMs,
-      ignoredPatchCount,
-      patchCount,
-    });
-  };
-
-  const beginLoading = () => {
-    isLoading = true;
+    diagnostics = {
+      ...diagnostics,
+      ...next,
+    };
     emitDiagnostics();
   };
 
-  const closeResources = async (currentState: ViewportDatasourceState) => {
-    await clearQueryRefreshFiber();
+  const makeIntent = (range = requestedRange): ViewportIntent | null => {
+    if (params === null) {
+      return null;
+    }
 
-    await ViewportDatasourceState.$match(currentState, {
-      Idle: async () => undefined,
-      Destroyed: async () => undefined,
-      Starting: async ({ session }) => {
-        await session.close().catch(() => undefined);
-      },
-      Live: async ({ session, scope }) => {
-        await runPromise(Scope.close(scope, Exit.succeed(undefined)));
-        await session.close().catch(() => undefined);
-      },
-    });
+    return {
+      storeId: collection.storeId,
+      startRow: range.startRow,
+      endRow: range.endRow,
+      query: readQuery(params),
+    };
   };
 
-  const applyPatch = (
-    currentParams: IViewportDatasourceParams<TData>,
-    patch: {
-      startRow: number;
-      endRow: number;
-      rowCount: number;
-      latencyMs: number;
-      metrics: StoreMetrics;
-      rows: ReadonlyArray<TData>;
-    },
-  ) => {
-    patchCount += 1;
-    isLoading = false;
-    lastPatchLatencyMs = patch.latencyMs;
+  const applyPatch = (patch: ViewportPatch<TData>) => {
+    if (params === null) {
+      return;
+    }
+
+    params.setRowCount(patch.rowCount, false);
+    params.setRowData(toViewportRows(patch.startRow, patch.rows));
     options.onSnapshot?.({
       startRow: patch.startRow,
       endRow: patch.endRow,
       rowCount: patch.rowCount,
-      metrics: patch.metrics,
     });
-    emitDiagnostics({
-      startRow: patch.startRow,
-      endRow: patch.endRow,
-    });
-    currentParams.setRowCount(patch.rowCount, true);
-    currentParams.setRowData(toViewportRows(patch.startRow, patch.rows));
-  };
-
-  const startViewportSession = (currentParams: IViewportDatasourceParams<TData>) => {
-    const version = state.version + 1;
-    const nextSession = collection.openViewportSession({
-      startRow: viewportRange.startRow,
-      endRow: viewportRange.endRow,
-      query: readQuery(currentParams),
-    });
-
-    let startPromise = Promise.resolve();
-    state = ViewportDatasourceState.Starting({
-      version,
-      session: nextSession,
-      startPromise,
-    });
-    startPromise = (async () => {
-      const scope = await runPromise(Scope.make());
-      const latestState = state;
-      if (
-        params !== currentParams ||
-        latestState._tag !== "Starting" ||
-        latestState.version !== version ||
-        latestState.session !== nextSession
-      ) {
-        await runPromise(Scope.close(scope, Exit.succeed(undefined)));
-        await nextSession.close().catch(() => undefined);
-        return;
-      }
-
-      state = ViewportDatasourceState.Live({
-        version,
-        session: nextSession,
-        scope,
-      });
-      await runPromise(
-        Scope.extend(
-          Stream.runForEachScoped(nextSession.updates, (patch) =>
-            Effect.sync(() => {
-              const currentState = state;
-              if (
-                params === null ||
-                params !== currentParams ||
-                currentState._tag !== "Live" ||
-                currentState.version !== version ||
-                currentState.session !== nextSession
-              ) {
-                ignoredPatchCount += 1;
-                emitDiagnostics();
-                return;
-              }
-
-              applyPatch(currentParams, patch);
-            }),
-          ).pipe(Effect.forkScoped),
-          scope,
-        ),
-      );
-    })().finally(() => {
-      const latestState = state;
-      if (
-        latestState._tag === "Starting" &&
-        latestState.version === version &&
-        latestState.session === nextSession
-      ) {
-        state = ViewportDatasourceState.Idle({
-          version,
-        });
-      }
-    });
-
-    state = ViewportDatasourceState.Starting({
-      version,
-      session: nextSession,
-      startPromise,
-    });
-    return startPromise;
-  };
-
-  const syncViewportQuery = async (kind: ViewportRefreshKind) => {
-    const currentParams = params;
-    if (currentParams === null) {
-      return;
-    }
-
-    await ViewportDatasourceState.$match(readState(), {
-      Destroyed: async () => undefined,
-      Idle: async () => {
-        beginLoading();
-        await startViewportSession(currentParams);
+    updateDiagnostics({
+      fulfilledRange: {
+        startRow: patch.startRow,
+        endRow: patch.endRow,
       },
-      Starting: async ({ startPromise }) => {
-        await startPromise;
-        await syncViewportQuery(kind);
-      },
-      Live: async ({ session }) => {
-        if (kind === "query") {
-          beginLoading();
-        }
-
-        if (!isFiniteRowIndex(viewportRange.startRow) || !isFiniteRowIndex(viewportRange.endRow)) {
-          return;
-        }
-
-        await session.replace({
-          startRow: viewportRange.startRow,
-          endRow: viewportRange.endRow,
-          query: readQuery(currentParams),
-        }).catch(() => undefined);
-      },
+      isLoading: false,
+      lastPatchLatencyMs: patch.latencyMs,
+      patchCount: diagnostics.patchCount + 1,
     });
   };
 
-  const scheduleViewportQueryRefresh = async () => {
-    const token = ++queryRefreshToken;
-    await clearQueryRefreshFiber();
-    if (token !== queryRefreshToken) {
+  const sendLatestIntent = () => {
+    if (channel === null) {
       return;
     }
 
-    if (queryDebounceMs <= 0) {
-      await syncViewportQuery("query").catch(() => undefined);
+    const intent = makeIntent();
+    if (intent === null) {
       return;
     }
 
-    let fiber: Fiber.RuntimeFiber<void, unknown>;
-    fiber = runFork(
-      Effect.sleep(Duration.millis(queryDebounceMs)).pipe(
-        Effect.andThen(
-          Effect.suspend(() => token === queryRefreshToken
-            ? Effect.promise(() => syncViewportQuery("query"))
-            : Effect.void),
-        ),
-        Effect.ensuring(
-          Effect.sync(() => {
-            if (queryRefreshFiber === fiber) {
-              queryRefreshFiber = null;
-            }
-          }),
-        ),
-      ),
-    );
-    queryRefreshFiber = fiber;
+    updateDiagnostics({
+      requestedRange,
+      isLoading: true,
+    });
+    void channel.setIntent(intent).catch(reportViewportError);
+  };
+
+  const flushQueuedQueryChange = () => {
+    queryChangeQueued = false;
+    sendLatestIntent();
+  };
+
+  const destroy = () => {
+    if (updatesFiber !== null) {
+      Effect.runFork(Fiber.interrupt(updatesFiber));
+      updatesFiber = null;
+    }
+
+    if (channel !== null) {
+      void channel.close().catch(() => undefined);
+      channel = null;
+    }
+
+    queryChangeQueued = false;
+    params = null;
   };
 
   return {
     init(nextParams) {
+      destroy();
       params = nextParams;
-      void startViewportSession(nextParams).catch(reportViewportError);
+      requestedRange = {
+        startRow: 0,
+        endRow: INITIAL_VIEWPORT_ROW_COUNT,
+      };
+      diagnostics = {
+        requestedRange,
+        fulfilledRange: null,
+        isLoading: true,
+        lastPatchLatencyMs: null,
+        patchCount: 0,
+      };
+      emitDiagnostics();
+
+      const initialIntent = makeIntent(requestedRange);
+      if (initialIntent === null) {
+        return;
+      }
+
+      channel = collection.openViewportChannel({
+        initialIntent,
+        throttleMs: options.throttleMs ?? DEFAULT_THROTTLE_MS,
+      });
+      updatesFiber = Effect.runFork(
+        Stream.runForEach(channel.updates, (patch) =>
+          Effect.sync(() => {
+            applyPatch(patch as ViewportPatch<TData>);
+          })),
+      );
     },
     setViewportRange(firstRow, lastRow) {
       if (!isFiniteRowIndex(firstRow) || !isFiniteRowIndex(lastRow)) {
         return;
       }
 
-      queryRefreshToken += 1;
-      viewportRange = {
+      requestedRange = {
         startRow: firstRow,
         endRow: lastRow + 1,
       };
-      void clearQueryRefreshFiber()
-        .then(() => syncViewportQuery("range"))
-        .catch(reportViewportError);
+      sendLatestIntent();
     },
-    refreshQuery(refreshOptions) {
-      if (refreshOptions?.debounce) {
-        void scheduleViewportQueryRefresh();
+    queryChanged() {
+      if (queryChangeQueued) {
         return;
       }
-      queryRefreshToken += 1;
-      void clearQueryRefreshFiber()
-        .then(() => syncViewportQuery("query"))
-        .catch(reportViewportError);
+
+      queryChangeQueued = true;
+      queueMicrotask(flushQueuedQueryChange);
     },
-    destroy() {
-      const currentState = state;
-      params = null;
-      state = ViewportDatasourceState.Destroyed({
-        version: currentState.version + 1,
-      });
-      void closeResources(currentState);
-    },
+    destroy,
   };
 }

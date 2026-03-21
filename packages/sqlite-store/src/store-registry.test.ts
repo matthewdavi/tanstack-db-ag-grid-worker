@@ -1,16 +1,25 @@
-import { describe, expect as vitestExpect, it } from "vitest";
+// @vitest-environment jsdom
+
+import { describe } from "vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
-import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import * as TestClock from "effect/TestClock";
+import { TestClock } from "effect/testing";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient";
 import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { effect, expect } from "@effect/vitest";
 
 import { defineSqliteStore } from "./store-config";
-import { StoreRegistry } from "./store-registry";
+import {
+  layerSqliteViewportChannelService,
+  seedSqliteStore,
+  SqliteViewportChannelService,
+} from "./store-registry";
+import { installFileFetchShim } from "./test-file-fetch";
+import type { ViewportPatch } from "./worker-contract";
 
 const stocksTable = sqliteTable("inventory_items", {
   sku: text("sku").primaryKey(),
@@ -30,31 +39,6 @@ type StockRow = typeof stocksTable.$inferSelect;
 const stockStore = defineSqliteStore({
   table: stocksTable,
   rowKey: "sku",
-  rowFactory: {
-    createStressRowFactory(seed, startIndex, options) {
-      let index = startIndex;
-      return () => {
-        const nextIndex = index;
-        index += 1;
-        const timestamp = options?.realtimeTimestamps
-          ? new Date(Date.UTC(2026, 2, 20, 12, 0, 0, nextIndex)).toISOString()
-          : "2026-01-01T00:00:00.000Z";
-
-        return {
-          sku: `stress-${seed}-${nextIndex}`,
-          active: true,
-          symbol: `SYM${nextIndex}`,
-          company: `Stress ${nextIndex}`,
-          sector: "Technology",
-          venue: "NASDAQ",
-          price: 100 + nextIndex,
-          volume: 1000 + nextIndex,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        };
-      };
-    },
-  },
 });
 
 const STOCK_ROWS: ReadonlyArray<StockRow> = [
@@ -96,67 +80,83 @@ const STOCK_ROWS: ReadonlyArray<StockRow> = [
   },
 ];
 
-function loadStocks(registry: StoreRegistry<StockRow>) {
-  return Effect.promise(() =>
-    registry.loadStore(
-      {
-        storeId: "stocks",
-      },
-      {
-        kind: "rows",
-        rows: STOCK_ROWS,
-      },
-    ),
-  );
+installFileFetchShim();
+
+function testLayer() {
+  return layerSqliteViewportChannelService(stockStore, {
+    storeId: "stocks",
+  }).pipe(Layer.provideMerge(SqliteClient.layerMemory({})));
 }
 
-function withPatches<T>(
-  registry: StoreRegistry<StockRow>,
-  execute: (patches: Queue.Queue<{ rows: ReadonlyArray<StockRow>; rowCount: number; latencyMs: number }>) => Effect.Effect<T, string, never>,
-) {
-  return Effect.scoped(Effect.gen(function* () {
-    const patches = yield* Queue.unbounded<{ rows: ReadonlyArray<StockRow>; rowCount: number; latencyMs: number }>();
-    yield* Stream.runForEachScoped(
-      registry.openViewportSession({
-        sessionId: "session-1",
-        storeId: "stocks",
-        startRow: 0,
-        endRow: 2,
-        query: {
-          predicate: null,
-          sorts: [{ field: "symbol", direction: "asc" }],
-        },
-      }),
-      (patch) => Queue.offer(patches, patch),
-    ).pipe(Effect.forkScoped);
+const seedStocks = seedSqliteStore(stockStore, STOCK_ROWS);
 
-    return yield* execute(patches);
-  }));
+function upsertStocks(rows: ReadonlyArray<StockRow>) {
+  return Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    for (const row of rows) {
+      yield* sql.unsafe(stockStore.upsertSql, stockStore.encodeRow(row));
+    }
+  });
 }
 
-describe("sqlite store registry", () => {
-  effect("opens a viewport session and returns the initial sorted slice", () =>
+function withPatches<T, E, R>(
+  execute: (context: {
+    patches: Queue.Queue<ViewportPatch<StockRow>>;
+    channelService: SqliteViewportChannelService<StockRow>;
+  }) => Effect.Effect<T, E, R>,
+): Effect.Effect<T, E, SqliteViewportChannelService<StockRow> | R> {
+  return Effect.scoped(
     Effect.gen(function* () {
-      const registry = new StoreRegistry(stockStore);
-      yield* loadStocks(registry);
+      const channelService =
+        (yield* SqliteViewportChannelService) as SqliteViewportChannelService<StockRow>;
+      const patches = yield* Queue.unbounded<ViewportPatch<StockRow>>();
 
-      const patch = yield* withPatches(registry, (patches) => Queue.take(patches));
+      yield* Stream.runForEach(
+        channelService.connect(
+          "connection-1",
+          {
+            storeId: "stocks",
+            startRow: 0,
+            endRow: 2,
+            query: {
+              predicate: null,
+              sorts: [{ field: "symbol", direction: "asc" }],
+            },
+          },
+          { throttleMs: 100 },
+        ),
+        (patch) => Queue.offer(patches, patch as ViewportPatch<StockRow>),
+      ).pipe(Effect.forkScoped);
 
-      expect(patch.rows.map((row: StockRow) => row.symbol)).toEqual(["ALFA", "BRAV"]);
+      return yield* execute({
+        patches,
+        channelService,
+      });
+    }),
+  ) as Effect.Effect<T, E, SqliteViewportChannelService<StockRow> | R>;
+}
+
+describe("sqlite viewport channel service", () => {
+  effect("connect emits the initial sorted slice", () =>
+    Effect.gen(function* () {
+      yield* seedStocks;
+
+      const patch = yield* withPatches(({ patches }) => Queue.take(patches));
+
+      expect(patch.rows.map((row) => row.symbol)).toEqual(["ALFA", "BRAV"]);
       expect(patch.rowCount).toBe(3);
-      expect(patch.latencyMs).toBe(0);
-    }));
+    }).pipe(Effect.provide(testLayer())));
 
-  effect("reruns the visible window immediately when the range changes", () =>
+  effect("setIntent reruns the visible window for the latest range", () =>
     Effect.gen(function* () {
-      const registry = new StoreRegistry(stockStore);
-      yield* loadStocks(registry);
+      yield* seedStocks;
 
-      const result = yield* withPatches(registry, (patches) =>
+      const result = yield* withPatches(({ patches, channelService }) =>
         Effect.gen(function* () {
           const initial = yield* Queue.take(patches);
-          yield* registry.replaceViewportSession({
-            sessionId: "session-1",
+
+          yield* channelService.setIntent("connection-1", {
+            storeId: "stocks",
             startRow: 1,
             endRow: 3,
             query: {
@@ -164,257 +164,125 @@ describe("sqlite store registry", () => {
               sorts: [{ field: "symbol", direction: "asc" }],
             },
           });
-          const shifted = yield* Queue.take(patches);
 
+          const shifted = yield* Queue.take(patches);
           return {
-            initial: initial.rows.map((row: StockRow) => row.symbol),
-            shifted: shifted.rows.map((row: StockRow) => row.symbol),
+            initial: initial.rows.map((row) => row.symbol),
+            shifted: shifted.rows.map((row) => row.symbol),
           };
-        }));
+        }),
+      );
 
       expect(result.initial).toEqual(["ALFA", "BRAV"]);
       expect(result.shifted).toEqual(["BRAV", "ZETA"]);
-    }));
+    }).pipe(Effect.provide(testLayer())));
 
-  effect("reruns the query immediately when sort or filter changes", () =>
+  effect("invalidate reruns the current viewport", () =>
     Effect.gen(function* () {
-      const registry = new StoreRegistry(stockStore);
-      yield* loadStocks(registry);
+      yield* seedStocks;
 
-      const result = yield* withPatches(registry, (patches) =>
+      const patch = yield* withPatches(({ patches, channelService }) =>
         Effect.gen(function* () {
           yield* Queue.take(patches);
 
-          yield* registry.replaceViewportSession({
-            sessionId: "session-1",
-            startRow: 0,
-            endRow: 2,
-            query: {
-              predicate: {
-                kind: "comparison",
-                field: "sector",
-                filterType: "text",
-                operator: "eq",
-                value: "Technology",
-              },
-              sorts: [{ field: "price", direction: "desc" }],
+          yield* upsertStocks([
+            {
+              sku: "4",
+              active: true,
+              symbol: "CHAR",
+              company: "Charlie Corp",
+              sector: "Energy",
+              venue: "IEX",
+              price: 180,
+              volume: 1000,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              updatedAt: "2026-01-01T00:00:00.000Z",
             },
-          });
+          ]);
 
-          const filtered = yield* Queue.take(patches);
-          return filtered.rows.map((row: StockRow) => row.symbol);
-        }));
+          yield* channelService.invalidate;
+          return yield* Queue.take(patches);
+        }),
+      );
 
-      expect(result).toEqual(["ZETA", "BRAV"]);
-    }));
+      expect(patch.rowCount).toBe(4);
+    }).pipe(Effect.provide(testLayer())));
 
-  effect("deletes rows using the configured row key", () =>
+  effect("throttles repeated invalidations in the worker", () =>
     Effect.gen(function* () {
-      const registry = new StoreRegistry(stockStore);
-      yield* loadStocks(registry);
+      yield* seedStocks;
 
-      const result = yield* withPatches(registry, (patches) =>
+      const counts = yield* withPatches(({ patches, channelService }) =>
         Effect.gen(function* () {
-          yield* Queue.take(patches);
-          yield* Effect.promise(() =>
-            registry.applyTransaction("stocks", {
-              kind: "delete",
-              ids: ["2"],
-            }),
-          );
-          const patch = yield* Queue.take(patches);
-          return patch.rows.map((row) => row.symbol);
-        }));
+          const seen: Array<number> = [];
 
-      expect(result).toEqual(["BRAV", "ZETA"]);
-    }));
+          seen.push((yield* Queue.take(patches)).rowCount);
 
-  effect("coalesces write-driven refreshes to one patch per 100ms window", () =>
-    Effect.gen(function* () {
-      const runtime = yield* Effect.runtime<never>();
-      const registry = new StoreRegistry(stockStore, { runtime });
-      yield* loadStocks(registry);
-
-      const seen = yield* Effect.scoped(Effect.gen(function* () {
-        const patches = yield* Queue.unbounded<number>();
-        yield* Stream.runForEachScoped(
-          registry.openViewportSession({
-            sessionId: "session-1",
-            storeId: "stocks",
-            startRow: 0,
-            endRow: 2,
-            query: {
-              predicate: null,
-              sorts: [{ field: "symbol", direction: "asc" }],
+          yield* upsertStocks([
+            {
+              sku: "4",
+              active: true,
+              symbol: "CHAR",
+              company: "Charlie Corp",
+              sector: "Energy",
+              venue: "IEX",
+              price: 180,
+              volume: 1000,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              updatedAt: "2026-01-01T00:00:00.000Z",
             },
-          }),
-          (patch) => Queue.offer(patches, patch.rowCount),
-        ).pipe(Effect.forkScoped);
+          ]);
+          yield* channelService.invalidate;
 
-        const counts: Array<number> = [];
-        counts.push(yield* Queue.take(patches));
-
-        yield* Effect.promise(() =>
-          registry.applyTransaction("stocks", {
-            kind: "upsert",
-            rows: [
-              {
-                sku: "4",
-                active: true,
-                symbol: "CHAR",
-                company: "Charlie Corp",
-                sector: "Energy",
-                venue: "IEX",
-                price: 180,
-                volume: 1000,
-                createdAt: "2026-01-01T00:00:00.000Z",
-                updatedAt: "2026-01-01T00:00:00.000Z",
-              },
-            ],
-          }),
-        );
-        yield* Effect.promise(() =>
-          registry.applyTransaction("stocks", {
-            kind: "upsert",
-            rows: [
-              {
-                sku: "5",
-                active: true,
-                symbol: "DELT",
-                company: "Delta Corp",
-                sector: "Healthcare",
-                venue: "NYSE",
-                price: 210,
-                volume: 1000,
-                createdAt: "2026-01-01T00:00:00.000Z",
-                updatedAt: "2026-01-01T00:00:00.000Z",
-              },
-            ],
-          }),
-        );
-
-        expect(counts).toEqual([3]);
-
-        yield* TestClock.adjust(Duration.millis(100));
-        counts.push(yield* Queue.take(patches));
-        return counts;
-      }));
-
-      expect(seen).toEqual([3, 5]);
-    }));
-
-  effect("reports write refresh latency from query execution, not throttle delay", () =>
-    Effect.gen(function* () {
-      const runtime = yield* Effect.runtime<never>();
-      const registry = new StoreRegistry(stockStore, { runtime });
-      yield* loadStocks(registry);
-
-      const patch = yield* Effect.scoped(Effect.gen(function* () {
-        const patches = yield* Queue.unbounded<any>();
-        yield* Stream.runForEachScoped(
-          registry.openViewportSession({
-            sessionId: "session-1",
-            storeId: "stocks",
-            startRow: 0,
-            endRow: 2,
-            query: {
-              predicate: null,
-              sorts: [{ field: "updatedAt", direction: "desc" }],
+          yield* upsertStocks([
+            {
+              sku: "5",
+              active: true,
+              symbol: "DELT",
+              company: "Delta Corp",
+              sector: "Healthcare",
+              venue: "NYSE",
+              price: 210,
+              volume: 1000,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              updatedAt: "2026-01-01T00:00:00.000Z",
             },
-          }),
-          (nextPatch) => Queue.offer(patches, nextPatch),
-        ).pipe(Effect.forkScoped);
+          ]);
+          yield* channelService.invalidate;
 
-        yield* Queue.take(patches);
-        yield* Effect.promise(() =>
-          registry.applyTransaction("stocks", {
-            kind: "upsert",
-            rows: [
-              {
-                sku: "4",
-                active: true,
-                symbol: "CHAR",
-                company: "Charlie Corp",
-                sector: "Energy",
-                venue: "IEX",
-                price: 180,
-                volume: 1000,
-                createdAt: "2026-01-01T00:00:00.000Z",
-                updatedAt: "2026-01-01T00:00:00.000Z",
-              },
-            ],
-          }),
-        );
+          expect(seen).toEqual([3]);
 
-        yield* TestClock.adjust(Duration.millis(100));
-        return yield* Queue.take(patches);
-      }));
-
-      expect(patch.latencyMs).toBe(0);
-    }));
-
-  it("keeps generating fresh stress batches on each tick", async () => {
-    const registry = new StoreRegistry(stockStore, {
-      writeRefreshThrottleMs: 0,
-    });
-    await registry.loadStore(
-      {
-        storeId: "stocks",
-      },
-      {
-        kind: "rows",
-        rows: STOCK_ROWS,
-      },
-    );
-
-    const scope = await Effect.runPromise(Effect.scoped(Scope.make()));
-    const patches = await Effect.runPromise(Queue.unbounded<number>());
-    await Effect.runPromise(
-      Scope.extend(
-        Stream.runForEachScoped(
-          registry.openViewportSession({
-            sessionId: "session-1",
-            storeId: "stocks",
-            startRow: 0,
-            endRow: 2,
-            query: {
-              predicate: null,
-              sorts: [{ field: "updatedAt", direction: "desc" }],
-            },
-          }),
-          (patch) => Queue.offer(patches, patch.rowCount),
-        ).pipe(Effect.forkScoped),
-        scope,
-      ),
-    );
-
-    await Effect.runPromise(Queue.take(patches));
-    const state = registry.setStressRate("stocks", 600);
-    vitestExpect(state.running).toBe(true);
-
-    await Effect.runPromise(Effect.sleep(Duration.millis(150)));
-    const firstCount = await Effect.runPromise(
-      Queue.take(patches).pipe(
-        Effect.timeoutFail({
-          duration: Duration.seconds(1),
-          onTimeout: () => "timed out waiting for first stress patch",
+          yield* TestClock.adjust(Duration.millis(100));
+          seen.push((yield* Queue.take(patches)).rowCount);
+          return seen;
         }),
-      ),
-    );
-    vitestExpect(firstCount).toBeGreaterThan(3);
+      );
 
-    await Effect.runPromise(Effect.sleep(Duration.millis(150)));
-    const secondCount = await Effect.runPromise(
-      Queue.take(patches).pipe(
-        Effect.timeoutFail({
-          duration: Duration.seconds(1),
-          onTimeout: () => "timed out waiting for second stress patch",
-        }),
-      ),
-    );
-    vitestExpect(secondCount).toBeGreaterThan(firstCount);
+      expect(counts).toEqual([3, 4]);
+    }).pipe(Effect.provide(testLayer())));
 
-    registry.setStressRate("stocks", 0);
-    await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
-  });
+  effect("close removes the channel and stops future updates", () =>
+    Effect.gen(function* () {
+      yield* seedStocks;
+      const channelService = yield* SqliteViewportChannelService;
+
+      yield* Stream.runDrain(
+        channelService.connect(
+          "connection-1",
+          {
+            storeId: "stocks",
+            startRow: 0,
+            endRow: 2,
+            query: {
+              predicate: null,
+              sorts: [],
+            },
+          },
+          { throttleMs: 100 },
+        ).pipe(Stream.take(1)),
+      );
+
+      const result = yield* channelService.close("connection-1");
+      expect(result.closed).toBe(true);
+    }).pipe(Effect.provide(testLayer())));
 });
