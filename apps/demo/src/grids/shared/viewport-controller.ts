@@ -26,6 +26,15 @@ interface CreateViewportGridControllerOptions {
   onSetStressRate?: (rowsPerSecond: number) => void;
 }
 
+function shouldShowGridLoadingOverlay(
+  useGridLoadingOverlay: boolean,
+  diagnostics: ReturnType<typeof createInitialViewportDiagnostics>,
+) {
+  return useGridLoadingOverlay &&
+    diagnostics.isLoading &&
+    diagnostics.patchCount === 0;
+}
+
 export function createViewportGridController(
   options: CreateViewportGridControllerOptions,
 ){
@@ -63,8 +72,10 @@ export function createViewportGridController(
     gridApi.setGridOption("viewportDatasource", datasource);
     setGridLoading(
       gridApi,
-      options.useGridLoadingOverlay &&
-        store.getSnapshot().context.diagnostics.isLoading,
+      shouldShowGridLoadingOverlay(
+        options.useGridLoadingOverlay,
+        store.getSnapshot().context.diagnostics,
+      ),
     );
   };
 
@@ -128,7 +139,10 @@ export function createViewportGridController(
       subscription = store.subscribe((snapshot) => {
         setGridLoading(
           api,
-          options.useGridLoadingOverlay && snapshot.context.diagnostics.isLoading,
+          shouldShowGridLoadingOverlay(
+            options.useGridLoadingOverlay,
+            snapshot.context.diagnostics,
+          ),
         );
       });
       event.api.addEventListener("gridPreDestroyed", cleanup);
