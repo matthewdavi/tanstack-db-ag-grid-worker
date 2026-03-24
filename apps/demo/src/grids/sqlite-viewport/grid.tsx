@@ -33,7 +33,7 @@ export function SqliteViewportGrid(props: SqliteViewportGridProps) {
     <GridCard
       title={"SQLite SQL Viewport"}
       body={
-        "ridiculously fast. sql + viewport live in the worker. ui thread doesn't know what's going on. it thinks it's rendering like 50 rows but there are no fewer than 100,000 in there."
+        "ridiculously fast. sql + viewport live in the worker. ui thread doesn't worry about filtering or sorting. it thinks it's rendering like 50 rows but there are no fewer than 100,000 in there."
       }
       status={"fast / sqlite"}
     >

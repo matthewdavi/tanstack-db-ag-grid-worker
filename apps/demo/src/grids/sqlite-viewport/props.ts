@@ -7,8 +7,8 @@ import type { MarketRow } from "../../market-sqlite-store";
 import { createRowCountStatusBar } from "../shared/status-bar";
 import { createViewportGridController } from "../shared/viewport-controller";
 import {
+  createViewportLoadingOverlay,
   defaultMarketColumnDef,
-  getStableMarketRowId,
   marketColumnDefs,
 } from "../shared/market-grid-props";
 
@@ -16,7 +16,10 @@ export const sqliteViewportGridProps: AgGridReactProps<MarketRow> = {
   theme: demoGridTheme,
   columnDefs: [...marketColumnDefs],
   defaultColDef: defaultMarketColumnDef,
-  getRowId: getStableMarketRowId,
+  overlayLoadingTemplate: createViewportLoadingOverlay(
+    "Initializing DB",
+    "Starting SQLite in the worker and loading the first viewport.",
+  ),
   rowModelType: "viewport",
   viewportRowModelPageSize: 50,
   viewportRowModelBufferSize: 20,
@@ -30,7 +33,7 @@ export function getSqliteViewportGridModel(client: DemoSqliteClient) {
   if (!controller) {
     controller = createViewportGridController({
       datasourceClient: client,
-      useGridLoadingOverlay: false,
+      useGridLoadingOverlay: true,
       onPushLiveUpdate() {
         client.pushLiveUpdate();
       },

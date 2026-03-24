@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   optimizeDeps: {
     exclude: [
+      "@sqlite.org/sqlite-wasm",
       "@effect/sql-sqlite-wasm",
       "@effect/wa-sqlite",
       "@sandbox/ag-grid-translator",
